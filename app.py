@@ -825,21 +825,47 @@ def entry_from_page(p):
 
 
 # ---- Wikipedia calls ---------------------------------------------------------
+_wiki_gate = threading.Lock()
+_wiki_last = [0.0]
+
+
 def wiki_api(params, post=False):
-    q = {"format": "json", "formatversion": "2", **params}
+    """One request at a time, spaced out, and patient with Wikipedia's rate limit (HTTP 429)."""
+    q = {"format": "json", "formatversion": "2", "maxlag": "5", **params}
     body = urlencode(q)
     last = None
-    for attempt in range(3):
+    for attempt in range(6):
+        wait = 0.0
         try:
+            with _wiki_gate:   # paces every call from every thread
+                gap = 0.4 - (time.time() - _wiki_last[0])
+                if gap > 0:
+                    time.sleep(gap)
+                _wiki_last[0] = time.time()
             if post:
                 req = Request(WIKI_API, data=body.encode(), headers={"User-Agent": WIKI_UA})
             else:
                 req = Request(WIKI_API + "?" + body, headers={"User-Agent": WIKI_UA})
             with urlopen(req, timeout=25) as r:
-                return json.loads(r.read().decode("utf-8", "replace"))
+                d = json.loads(r.read().decode("utf-8", "replace"))
+            if (d.get("error") or {}).get("code") == "maxlag":
+                wait = 5
+                raise RuntimeError("Wikipedia is busy")
+            return d
+        except HTTPError as ex:
+            last = ex
+            if ex.code in (429, 503):
+                try:
+                    wait = min(float(ex.headers.get("Retry-After", "")), 60)
+                except ValueError:
+                    wait = 0
+                wait = wait or min(4 * 2 ** attempt, 60)
+            else:
+                wait = 1.5 * (attempt + 1)
         except Exception as ex:
             last = ex
-            time.sleep(1.5 * (attempt + 1))
+            wait = wait or 1.5 * (attempt + 1)
+        time.sleep(wait)
     raise last
 
 
@@ -867,7 +893,7 @@ def crawl_category(top, log):
     for depth in range(3):
         if not level or len(seen) > RS_MAX_CATEGORIES:
             break
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(category_members, level))
         nxt = []
         for pages, subs in results:
@@ -905,7 +931,7 @@ def build_type(tname):
         titles = crawl_category(cat, log)
         batches = [titles[i:i + 50] for i in range(0, len(titles), 50)]
         entries = []
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=2) as pool:
             for boxes, got in pool.map(fetch_batch, batches):
                 log["with_infobox"] += boxes
                 entries += got
