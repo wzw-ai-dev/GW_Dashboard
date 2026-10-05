@@ -1,13 +1,15 @@
-import calendar, hmac, os, re, time
+import hmac, json, os, re, threading, time
+from calendar import timegm
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import quote
+from datetime import datetime, timezone
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
-import feedparser
 from flask import Flask, Response, jsonify, request
 
 app = Flask(__name__)
 
-# Login: set GW_PASSWORD (and optionally GW_USER) on the host. If unset, no login (local use).
+# Login: set GW_PASSWORD (and optionally GW_USER) on the host. If unset, no login.
 GW_USER = os.environ.get("GW_USER", "gw")
 GW_PASSWORD = os.environ.get("GW_PASSWORD")
 
@@ -22,22 +24,28 @@ def require_login():
         return None
     return Response("Login required", 401, {"WWW-Authenticate": 'Basic realm="GW dashboard"'})
 
-CACHE_SECONDS = 1800          # news is re-fetched at most every 30 min
-MIN_REFRESH_GAP = 10          # Refresh button can't hammer the feeds
-TOP_N = 10
 
-# Edit these to change what the dashboard tracks.
-# search phrase -> theme used if the headline itself matches no keyword
-QUERIES = {
-    "guided missile": "General",
-    "missile seeker": "Seeker",
-    "precision strike missile contract": "Production",
-    "hypersonic missile test": "Hypersonic",
-    "low-cost cruise missile": "Low-cost",
-    "missile interceptor": "Interceptors",
-    "solid rocket motor missile": "Propulsion",
-    "air-to-air missile production": "Production",
-}
+# ---- Settings you can edit ---------------------------------------------------
+NEWSDATA_KEY = os.environ.get("NEWSDATA_API_KEY")  # set on Render, never in this file
+CACHE_SECONDS = 3600               # reuse saved news for up to 1 hour
+MIN_REFRESH_GAP = 60               # a new fetch can't start more often than this
+MAX_NEWSDATA_CALLS_PER_DAY = 150   # free plan allows about 200; stay under it
+TOP_N = 10
+TIMEOUT = 12
+UA = "Mozilla/5.0 (compatible; GWDashboard/1.0)"
+
+# Each search is one NewsData.io request (keep each under ~100 characters).
+QUERIES = [
+    '"guided missile" OR "missile seeker" OR "precision strike missile"',
+    '"hypersonic missile" OR "cruise missile" OR "low-cost missile"',
+    '"missile interceptor" OR "air defense missile" OR "solid rocket motor"',
+]
+# Fallback source (no key): one combined search.
+GDELT_QUERY = ('("guided missile" OR "missile seeker" OR "hypersonic missile" '
+               'OR "missile interceptor" OR "cruise missile") sourcelang:english')
+# A story must mention at least one of these, to cut off-topic results.
+RELEVANT = ["missile", "munition", "interceptor", "hypersonic", "rocket motor",
+            "seeker", "air defense", "air defence"]
 THEMES = {
     "Seeker": ["seeker", "infrared", "radar", "guidance", "targeting", "sensor"],
     "Propulsion": ["rocket motor", "propulsion", "scramjet", "solid rocket", "engine"],
@@ -50,58 +58,127 @@ THEMES = {
     "Datalink": ["data link", "datalink", "networked", "communications"],
     "Testing": ["test", "fires", "fired", "launch", "trial", "demonstrat", "flight"],
 }
+# ------------------------------------------------------------------------------
 
-cache = {"items": [], "themes": {}, "updated": 0}
+cache = {"items": [], "themes": {}, "updated": 0, "tried": 0, "error": None,
+         "source": "none yet", "new": 0, "debug": []}
+calls = {"day": "", "n": 0}
+lock = threading.Lock()
 
 
-def fetch_one(item):
-    q, default = item
-    url = ("https://news.google.com/rss/search?q=" + quote(q + " when:7d")
-           + "&hl=en-US&gl=US&ceid=US:en")
+def http_json(url):
+    with urlopen(Request(url, headers={"User-Agent": UA}), timeout=TIMEOUT) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def fetch_newsdata(q):
+    data = http_json("https://newsdata.io/api/1/latest?" +
+                     urlencode({"apikey": NEWSDATA_KEY, "q": q, "language": "en"}))
+    if data.get("status") != "success":
+        raise RuntimeError("NewsData.io returned an error")
+    out = []
+    for r in data.get("results") or []:
+        try:
+            ts = timegm(time.strptime(r.get("pubDate") or "", "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            ts = time.time()
+        out.append({"title": r.get("title") or "", "link": r.get("link") or "",
+                    "source": r.get("source_name") or r.get("source_id") or "",
+                    "desc": r.get("description") or "", "ts": ts})
+    return out
+
+
+def fetch_gdelt():
+    data = http_json("https://api.gdeltproject.org/api/v2/doc/doc?" + urlencode({
+        "query": GDELT_QUERY, "mode": "artlist", "maxrecords": "50",
+        "format": "json", "sort": "datedesc", "timespan": "7d"}))
+    out = []
+    for a in data.get("articles") or []:
+        try:
+            ts = timegm(time.strptime(a.get("seendate") or "", "%Y%m%dT%H%M%SZ"))
+        except ValueError:
+            ts = time.time()
+        out.append({"title": a.get("title") or "", "link": a.get("url") or "",
+                    "source": a.get("domain") or "", "desc": "", "ts": ts})
+    return out
+
+
+def attempt(label, fn, *args):
     try:
-        return default, feedparser.parse(url).entries
-    except Exception:
-        return default, []
+        res = fn(*args)
+        return res, {"source": label, "stories": len(res), "status": "ok"}
+    except Exception as ex:  # never include the URL/key in what we record
+        return [], {"source": label, "stories": 0, "status": str(ex)[:80]}
 
 
 def fetch_news():
-    seen, now = {}, time.time()
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(fetch_one, QUERIES.items()))
-    for default, entries in results:
-        for e in entries:
-            title, _, src = e.title.rpartition(" - ")
-            title = title or e.title
-            src = e.get("source", {}).get("title") or src
-            key = re.sub(r"[^a-z0-9]", "", title.lower())[:60]
-            if key not in seen:
-                ts = calendar.timegm(e.published_parsed) if e.get("published_parsed") else now
-                text = title.lower()
-                seen[key] = {"title": title, "link": e.link, "source": src, "ts": ts,
-                             "hits": 0, "fb": set(),
-                             "tags": [t for t, kw in THEMES.items() if any(k in text for k in kw)]}
+    now, steps, articles, used = time.time(), [], [], None
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if calls["day"] != today:
+        calls.update(day=today, n=0)
+    if not NEWSDATA_KEY:
+        steps.append({"source": "NewsData.io", "stories": 0, "status": "skipped: no API key set"})
+    elif calls["n"] + len(QUERIES) > MAX_NEWSDATA_CALLS_PER_DAY:
+        steps.append({"source": "NewsData.io", "stories": 0, "status": "skipped: daily limit reached"})
+    else:
+        calls["n"] += len(QUERIES)
+        with ThreadPoolExecutor(max_workers=len(QUERIES)) as pool:
+            for res, step in pool.map(lambda q: attempt("NewsData.io", fetch_newsdata, q), QUERIES):
+                articles += res
+                steps.append(step)
+        if articles:
+            used = "NewsData.io"
+    if not articles:
+        articles, step = attempt("GDELT", fetch_gdelt)
+        steps.append(step)
+        if articles:
+            used = "GDELT"
+
+    seen = {}
+    for a in articles:
+        text = (a["title"] + " " + a["desc"]).lower()
+        if not a["title"] or not a["link"] or not any(k in text for k in RELEVANT):
+            continue
+        key = re.sub(r"[^a-z0-9]", "", a["title"].lower())[:60]
+        if key in seen:
             seen[key]["hits"] += 1
-            seen[key]["fb"].add(default)
+            continue
+        desc = a["desc"].strip()
+        seen[key] = {**a, "desc": desc[:220] + ("…" if len(desc) > 220 else ""), "hits": 1,
+                     "tags": [t for t, kw in THEMES.items() if any(k in text for k in kw)] or ["General"]}
     ranked = sorted(seen.values(),
                     key=lambda i: i["hits"] * 24 - (now - i["ts"]) / 3600, reverse=True)[:TOP_N]
-    for i in ranked:
-        if not i["tags"]:  # fall back to the search that found it
-            i["tags"] = sorted(t for t in i["fb"] if t != "General") or ["General"]
-        del i["fb"]
-    counts = {t: sum(t in i["tags"] for i in ranked) for t in [*THEMES, "General"]}
-    cache.update(items=ranked, themes=counts, updated=now)
+
+    cache["tried"], cache["debug"] = now, steps
+    if ranked:  # only replace saved news if we actually got some
+        old = {i["link"] for i in cache["items"]}
+        cache.update(items=ranked, updated=now, error=None, source=used,
+                     themes={t: sum(t in i["tags"] for i in ranked) for t in [*THEMES, "General"]},
+                     new=sum(i["link"] not in old for i in ranked) if old else 0)
+    else:
+        cache["error"] = "No news could be fetched right now. Try again in a few minutes."
 
 
 @app.route("/api/news")
 def news():
-    age = time.time() - cache["updated"]
-    did = False
-    if age > CACHE_SECONDS or (request.args.get("refresh") and age > MIN_REFRESH_GAP):
-        old = {i["link"] for i in cache["items"]}
-        fetch_news()
-        cache["new"] = sum(i["link"] not in old for i in cache["items"]) if old else 0
-        did = True
-    return jsonify({**cache, "refreshed": did})
+    now, did = time.time(), False
+    due = (now - cache["tried"] > MIN_REFRESH_GAP and
+           (now - cache["updated"] > CACHE_SECONDS or request.args.get("refresh")))
+    if due and lock.acquire(blocking=False):
+        try:
+            fetch_news()
+            did = True
+        finally:
+            lock.release()
+    return jsonify({**{k: v for k, v in cache.items() if k != "debug"}, "refreshed": did})
+
+
+@app.route("/api/debug")
+def debug():
+    return jsonify({"last_tried": cache["tried"], "error": cache["error"], "source": cache["source"],
+                    "newsdata_key_set": bool(NEWSDATA_KEY), "newsdata_calls_today": calls["n"],
+                    "steps": cache["debug"]})
 
 
 PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
@@ -136,11 +213,13 @@ function render(){
  $("#ls").replaceChildren(...data.map((d,n)=>({d,n})).filter(o=>f==="All"||o.d.tags.includes(f)).map(({d,n})=>{
   const c=el("div","","box it"),a=el("a",d.title,"t");a.href=d.link;a.target="_blank";a.rel="noopener";
   const mt=el("div",d.source+" · "+ago(d.ts),"meta");d.tags.forEach(t=>mt.append(el("span",t,"tag")));
-  const body=el("div");body.append(a,mt);c.append(el("div",n+1,"rk"),body);return c}))}
+  const body=el("div");body.append(a);if(d.desc)body.append(el("div",d.desc,"meta"));body.append(mt);c.append(el("div",n+1,"rk"),body);return c}))}
 async function load(force){$("#st").textContent="Loading…";
  try{const j=await(await fetch("/api/news"+(force?"?refresh=1":""))).json();data=j.items;themes=j.themes;
-  let m=force?(j.refreshed?"Refreshed: "+j.new+" new in top 10 · ":"Checked moments ago, wait a few seconds · "):"";
-  $("#st").textContent=m+"Last fetched "+new Date(j.updated*1000).toLocaleString()+" · source: Google News RSS";render()}
+  if(!j.items.length){$("#st").textContent=(j.error||"No stories yet. Try Refresh in a minute.")+" (details: /api/debug)";render();return}
+  let m=force?(j.refreshed?"Refreshed: "+j.new+" new in top 10 · ":"Checked moments ago, wait a minute · "):"";
+  if(j.error)m="Latest fetch failed, showing saved news · "+m;
+  $("#st").textContent=m+"Last fetched "+new Date(j.updated*1000).toLocaleString()+" · source: "+j.source;render()}
  catch(e){$("#st").textContent="Could not load news."}}
 $("#rf").onclick=()=>load(true);load();
 </script></body></html>"""
