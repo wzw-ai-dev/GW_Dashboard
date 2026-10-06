@@ -1063,7 +1063,7 @@ def wiki_url(title):
     return "https://en.wikipedia.org/wiki/" + quote(title.replace(" ", "_"), safe="()_,.'-")
 
 
-def rank_matches(q, top=5):
+def rank_matches(q, top=5, offset=0):
     pool = {}
     for t in (q["types"] or list(RESEARCH_TYPES)):
         for e in RS["data"].get(t, {}).get("entries", []):
@@ -1108,7 +1108,7 @@ def rank_matches(q, top=5):
         ranked.append((100 * num / den, known, e, marks))
     ranked.sort(key=lambda r: (-r[0], -r[1], r[2]["title"]))
     out = []
-    for score, known, e, marks in ranked[:top]:
+    for score, known, e, marks in ranked[offset:offset + top]:
         rows = []
         for label, keys, dim in SPEC_ROWS:
             if label in e["raw"] or label in marks:
@@ -1126,7 +1126,7 @@ def rank_matches(q, top=5):
         out.append({"title": e["title"], "url": wiki_url(e["title"]), "image": e.get("image", ""),
                     "score": int(round(score)), "sub": sub, "specs": rows,
                     "known": known, "asked": len(q["num"]) + bool(q["seeker"]) + bool(q["guidance"]) + bool(q["platform"])})
-    return out, len(pool)
+    return out, len(pool), len(ranked)
 
 
 load_cache()
@@ -1152,8 +1152,13 @@ def research_api():
                             RS["log"][failed[0]]["error"] + "). Try again in a few minutes.",
                             "progress": rs_progress()})
         return jsonify({"state": "loading", "progress": rs_progress()})
-    results, considered = rank_matches(q)
-    return jsonify({"state": "ready", "results": results, "considered": considered})
+    try:
+        offset = max(0, min(int(request.args.get("offset", 0)), 5000))
+    except ValueError:
+        offset = 0
+    results, considered, total = rank_matches(q, 5, offset)
+    return jsonify({"state": "ready", "results": results, "considered": considered,
+                    "total": total, "offset": offset})
 
 
 @app.route("/api/research/status")
@@ -1869,6 +1874,7 @@ h1{margin:0;font-family:var(--display);font-weight:700;font-size:clamp(1.9rem,8v
 .st.err{color:#8a2d2d}
 
 /* results */
+.more{display:flex;justify-content:center;margin:10px 0 18px}
 .res{list-style:none;margin:18px 0 0;padding:0 0 12px;display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,300px),1fr));gap:30px 22px}
 .card{--stack:0 1px 0 var(--x1),0 2px 0 var(--x2),0 3px 0 var(--x3),0 4px 0 var(--x4),0 5px 0 var(--x5),0 6px 0 var(--x6),0 7px 0 var(--x6);
   display:flex;flex-direction:column;height:100%;box-sizing:border-box;overflow:hidden;min-width:0;
@@ -1929,6 +1935,7 @@ h1{margin:0;font-family:var(--display);font-weight:700;font-size:clamp(1.9rem,8v
 
     <p class="st" id="st" aria-live="polite"></p>
     <ol class="res" id="res"></ol>
+    <div class="more" id="more" hidden><button class="btn" id="mb" type="button">Show next 5 matches</button></div>
     <p class="foot">Specifications come from Wikipedia infoboxes and are published figures, so they may be incomplete, rounded or disputed. Only systems with a Wikipedia infobox are searched. Text and images are available under CC BY-SA licences; open each article for full credits.</p>
   </main>
 </div>
@@ -2006,16 +2013,24 @@ function card(d, rank) {
   return li;
 }
 
-function render(j) {
+var shown = 0, lastQ = null;
+function render(j, append) {
   var box = $('#res');
-  box.replaceChildren();
-  (j.results || []).forEach(function (d, i) { box.append(card(d, i + 1)); });
-  if (!(j.results || []).length) {
+  if (!append) { box.replaceChildren(); shown = 0; }
+  (j.results || []).forEach(function (d, i) { box.append(card(d, shown + i + 1)); });
+  shown += (j.results || []).length;
+  var more = $('#more');
+  if (!shown) {
+    more.hidden = true;
     status('No published systems have figures for these parameters. Try fewer parameters or another type.');
-  } else {
-    var best = j.results[0].score;
-    status('Showing the ' + j.results.length + ' closest of ' + j.considered + ' systems' + (best < 40 ? '. No close matches found, so these are the nearest.' : '.'));
+    return;
   }
+  var left = j.total - shown;
+  more.hidden = left <= 0;
+  if (left > 0) $('#mb').textContent = 'Show next ' + Math.min(5, left) + ' matches (' + left + ' more)';
+  var first = box.querySelector('.pct');
+  status('Showing the ' + shown + ' closest of ' + j.total + ' matching systems (' + j.considered + ' checked)' +
+    (left <= 0 ? '. That is every match.' : '.') + (!append && j.results[0].score < 40 ? ' No close matches found, so these are the nearest.' : ''));
 }
 
 function run(e) {
@@ -2027,6 +2042,7 @@ function run(e) {
     return;
   }
   var my = ++token; tries = 0;
+  lastQ = q; $('#more').hidden = true;
   $('#go').disabled = true;
   status('Searching…');
   poll(q, my);
@@ -2053,7 +2069,15 @@ function poll(q, my) {
 }
 
 $('#f').addEventListener('submit', run);
-$('#clr').onclick = function () { token++; clearTimeout(timer); FIELDS.forEach(function (id) { $('#' + id).value = ''; }); $('#res').replaceChildren(); status(''); $('#go').disabled = false; };
+$('#mb').onclick = function () {
+  if (!lastQ) return;
+  var q = new URLSearchParams(lastQ.toString()); q.set('offset', String(shown));
+  var b = $('#mb'); b.disabled = true;
+  fetch('/api/research?' + q.toString()).then(function (r) { return r.json(); })
+    .then(function (j) { b.disabled = false; if (j.state === 'ready') render(j, true); else status(j.error || 'Could not load more. Try again.', true); })
+    .catch(function () { b.disabled = false; status('Could not reach the server. Try again.', true); });
+};
+$('#clr').onclick = function () { token++; $('#more').hidden = true; clearTimeout(timer); FIELDS.forEach(function (id) { $('#' + id).value = ''; }); $('#res').replaceChildren(); status(''); $('#go').disabled = false; };
 $('#ex').onclick = function () {
   FIELDS.forEach(function (id) { $('#' + id).value = ''; });
   $('#type').value = 'Anti-ship missile'; $('#range').value = '150'; $('#speed').value = '0.9'; $('#warhead').value = '200';
