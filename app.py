@@ -137,7 +137,8 @@ lock = threading.Lock()          # held while an update runs
 store_lock = threading.Lock()
 calls = {"day": "", "n": 0}
 state = {"running": False, "last_try": 0.0, "error": None, "steps": [], "store_note": ""}
-store = {"loaded": False, "days": {}, "sha": None, "branch_ok": False}
+store = {"loaded": False, "days": {}, "sha": None, "branch_ok": False, "awards": [], "awards_at": 0.0}
+aw_state = {"running": False, "last_try": 0.0, "error": None}
 
 
 def tz():
@@ -188,7 +189,7 @@ def gh(method, path, body=None):
 def read_local():
     try:
         with open(DATA_FILE, encoding="utf-8") as f:
-            return json.load(f).get("days", {})
+            return json.load(f)
     except (OSError, ValueError):
         return {}
 
@@ -197,23 +198,25 @@ def ensure_loaded():
     with store_lock:
         if store["loaded"]:
             return
-        days, note = None, ""
+        days, note, obj = None, "", {}
         if GH_TOKEN and GH_REPO:
             try:
                 j = gh("GET", "/repos/%s/contents/%s?ref=%s" % (GH_REPO, GH_PATH, GH_BRANCH))
-                days = json.loads(base64.b64decode(j["content"]).decode("utf-8")).get("days", {})
+                obj = json.loads(base64.b64decode(j["content"]).decode("utf-8"))
+                days = obj.get("days", {})
                 store["sha"] = j.get("sha")
                 store["branch_ok"] = True
             except HTTPError as ex:
                 if ex.code == 404:
-                    days = {}   # branch or file not created yet: fine, the first save creates it
+                    obj, days = {}, {}   # branch or file not created yet: fine, the first save creates it
                 else:
                     note = "GitHub storage unreachable (HTTP %s); using local file" % ex.code
             except Exception:
                 note = "GitHub storage unreachable; using local file"
         if days is None:
-            days = read_local()
-        store.update(days=days, loaded=True)
+            obj = read_local()
+            days = obj.get("days", {})
+        store.update(days=days, loaded=True, awards=obj.get("awards", []), awards_at=obj.get("awards_at", 0.0))
         state["store_note"] = note
 
 
@@ -233,7 +236,7 @@ def ensure_branch():
 
 
 def store_save(label):
-    payload = json.dumps({"days": store["days"]}, ensure_ascii=False, separators=(",", ":"))
+    payload = json.dumps({"days": store["days"], "awards": store["awards"], "awards_at": store["awards_at"]}, ensure_ascii=False, separators=(",", ":"))
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             f.write(payload)
@@ -447,6 +450,7 @@ def run_update():
                     d["items"] = slim(d["items"])
         store_save(slot)
         state["error"] = None
+        threading.Thread(target=run_awards, daemon=True).start()
         return True
     except Exception as ex:
         state["error"] = "Update failed: " + str(ex)[:80]
@@ -534,6 +538,148 @@ def compute_trends():
                     "lead": d["items"][0]["title"] if d["items"] else ""})
     return {"dates": keys, "days": n, "topics": topics, "terms": terms[:8], "log": log,
             "recent_days": k}
+
+
+# ---- Contract awards (public US government data, USAspending.gov) ----
+AREA_KEYWORDS = {
+    "Sensors & optics": ["infrared sensor", "electro-optical", "radar", "thermal imaging"],
+    "Communications": ["tactical radio", "satellite communications", "data link", "antenna"],
+    "Software & AI": ["software development", "machine learning", "modeling and simulation"],
+    "Materials": ["composite", "titanium", "ceramic", "coating"],
+    "Power & propulsion": ["turbine engine", "propulsion", "battery", "power generation"],
+    "Test services": ["test and evaluation", "calibration", "environmental testing", "range support"],
+    "Manufacturing": ["precision machining", "additive manufacturing", "precision manufacturing"],
+}
+AREAS = list(AREA_KEYWORDS)
+AWARD_DAYS = 30
+
+
+def pretty(text, limit=150):
+    t = re.sub(r"\s+", " ", text or "").strip()
+    if t and t.upper() == t:
+        t = t.lower().capitalize()
+    return t[:limit] + ("…" if len(t) > limit else "")
+
+
+def nice_company(name):
+    n = re.sub(r"\s+", " ", name or "").strip()
+    return n.title() if n.upper() == n else n
+
+
+def fetch_awards_area(area):
+    end = datetime.now(timezone.utc).date()
+    body = {"filters": {
+                "time_period": [{"start_date": str(end - timedelta(days=AWARD_DAYS)), "end_date": str(end),
+                                 "date_type": "action_date"}],
+                "award_type_codes": ["A", "B", "C", "D"],
+                "agencies": [{"type": "awarding", "tier": "toptier", "name": "Department of Defense"}],
+                "keywords": AREA_KEYWORDS[area]},
+            "fields": ["Award ID", "Recipient Name", "Award Amount", "Description",
+                       "Awarding Sub Agency", "Start Date", "generated_internal_id"],
+            "sort": "Award Amount", "order": "desc", "limit": 25, "page": 1}
+    req = Request("https://api.usaspending.gov/api/v2/search/spending_by_award/",
+                  data=json.dumps(body).encode(), method="POST",
+                  headers={"User-Agent": UA, "Content-Type": "application/json"})
+    with urlopen(req, timeout=40) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    out = []
+    for a in data.get("results") or []:
+        amt = a.get("Award Amount")
+        if not isinstance(amt, (int, float)) or amt <= 0 or not a.get("generated_internal_id"):
+            continue
+        out.append({"id": str(a.get("Award ID") or ""), "date": str(a.get("Start Date") or "")[:10],
+                    "who": nice_company(a.get("Recipient Name")), "what": pretty(a.get("Description")),
+                    "agency": nice_company(a.get("Awarding Sub Agency")), "value": amt, "area": area,
+                    "url": "https://www.usaspending.gov/award/" + str(a["generated_internal_id"])})
+    return out
+
+
+def run_awards():
+    """Refresh the contract list (best effort). Keeps the old list if the source is down."""
+    if aw_state["running"]:
+        return False
+    aw_state["running"] = True
+    try:
+        ensure_loaded()
+        got, errs = [], 0
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            for res, step in pool.map(lambda a: attempt("USAspending", fetch_awards_area, a), AREAS):
+                if step["status"] == "ok":
+                    got += res
+                else:
+                    errs += 1
+                    aw_state["error"] = "Some contract searches failed: " + step["status"]
+        seen, uniq = set(), []
+        for a in sorted(got, key=lambda x: -x["value"]):
+            if a["url"] not in seen:
+                seen.add(a["url"])
+                uniq.append(a)
+        if uniq:
+            with store_lock:
+                store["awards"] = sorted(uniq, key=lambda x: x["date"], reverse=True)
+                store["awards_at"] = time.time()
+            store_save(slot_of(local_now()))
+            aw_state["error"] = None if not errs else aw_state["error"]
+        elif not errs:
+            aw_state["error"] = "No contracts found."
+        return bool(uniq)
+    except Exception as ex:
+        aw_state["error"] = "Contract update failed: " + str(ex)[:80]
+        return False
+    finally:
+        aw_state["last_try"] = time.time()
+        aw_state["running"] = False
+
+
+def kick_awards():
+    ensure_loaded()
+    stale = time.time() - store["awards_at"] > 20 * 3600
+    if stale and not aw_state["running"] and time.time() - aw_state["last_try"] > RETRY_GAP:
+        threading.Thread(target=run_awards, daemon=True).start()
+        return True
+    return aw_state["running"]
+
+
+_CO_NOISE = re.compile(r"\b(inc|llc|ltd|corp|corporation|company|co|the|lp|llp|plc|group|holdings|usa|us)\b", re.I)
+
+
+def company_key(name):
+    w = re.sub(r"[^a-z0-9 ]", " ", _CO_NOISE.sub(" ", name.lower())).split()
+    return " ".join(w[:2])
+
+
+def supplier_summary():
+    """Top recipients per area from the awards, with how often they appear in the saved news."""
+    ensure_loaded()
+    titles = " | ".join(re.sub(r"[^a-z0-9 ]", " ", i["title"].lower())
+                        for d in store["days"].values() for i in d.get("items", []))
+    areas = {}
+    for a in store["awards"]:
+        e = areas.setdefault(a["area"], {}).setdefault(a["who"], {"name": a["who"], "value": 0.0, "awards": 0, "latest": a})
+        e["value"] += a["value"]
+        e["awards"] += 1
+        if a["date"] > e["latest"]["date"]:
+            e["latest"] = a
+    out = {}
+    for area, cos in areas.items():
+        rows = []
+        for c in cos.values():
+            k = company_key(c["name"])
+            mentions = titles.count(k) if len(k) > 3 else 0
+            rows.append({"name": c["name"], "value": c["value"], "awards": c["awards"], "mentions": mentions,
+                         "latest": c["latest"]["what"], "latest_date": c["latest"]["date"],
+                         "latest_url": c["latest"]["url"]})
+        rows.sort(key=lambda r: -r["value"])
+        out[area] = rows[:5]
+    return out
+
+
+@app.route("/api/contracts")
+def contracts_api():
+    updating = kick_awards()
+    return jsonify({"areas": AREAS, "awards": store["awards"][:200], "suppliers": supplier_summary(),
+                    "updated_label": nice(datetime.fromtimestamp(store["awards_at"], tz())) if store["awards_at"] else None,
+                    "updating": updating, "error": aw_state["error"], "window_days": AWARD_DAYS})
 
 
 @app.route("/api/news")
@@ -1629,6 +1775,193 @@ loadTrends();
 </body></html>"""
 
 
+CONTRACTS_PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Contracts &amp; Suppliers</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Jost:wght@500;700&family=Zilla+Slab:ital,wght@0,400;0,600;1,400&display=swap">
+<style>
+/* Layout: one column in the pastel-blue dashboard style; two tabs (Contract Awards, Supplier Map) under one header, with a topic filter. */
+:root{
+  color-scheme:light;
+  --bg:#dcebfa; --ink:#26324f; --muted:#52638a; --panel:#fcfcfb;
+  --aqua:#bfe8e3; --butter:#f7e7b0; --blue:#6f8be0; --link:#2f4fa2; --rise:#2f4fa2;
+  --ink-rgb:38 50 79; --blue-rgb:111 139 224;
+  --x3:color-mix(in srgb,var(--blue) 64%,var(--ink)); --x4:color-mix(in srgb,var(--blue) 56%,var(--ink));
+  --x5:color-mix(in srgb,var(--blue) 48%,var(--ink)); --x6:color-mix(in srgb,var(--blue) 40%,var(--ink));
+  --display:"Jost","Futura","Century Gothic",system-ui,sans-serif;
+  --body:"Zilla Slab","Archer","Rockwell",Georgia,serif;
+}
+*{box-sizing:border-box}
+body{margin:0;padding-inline:16px;padding-block:24px 56px;background:radial-gradient(60% 45% at 12% 4%,rgb(150 160 240 / .45),transparent 70%),radial-gradient(55% 40% at 94% 98%,rgb(176 230 226 / .8),transparent 70%),var(--bg);background-attachment:fixed;color:var(--ink);font-family:var(--body);font-size:16px;line-height:1.45}
+.page{max-width:62rem;margin:0 auto;min-width:0}
+.back{display:inline-block;color:var(--link);font-family:var(--display);font-weight:500;font-size:.95rem;letter-spacing:.06em;text-decoration:none;margin-bottom:6px}
+h1{margin:0;font-family:var(--display);font-weight:700;font-size:clamp(1.6rem,7vw,3rem);letter-spacing:.1em;text-transform:uppercase;line-height:1.1;text-shadow:3px 3px 0 var(--blue);text-wrap:balance}
+.sample{margin:14px 0 0;padding:9px 12px;border-radius:12px;border:1.5px dashed rgb(var(--ink-rgb) / .5);background:rgb(255 255 255 / .55);font-size:.95rem}
+.sample b{font-family:var(--display);letter-spacing:.1em;text-transform:uppercase;font-size:.78rem;margin-right:6px}
+.tabs{display:flex;gap:10px;margin:18px 0 0;flex-wrap:wrap}
+.tab{cursor:pointer;padding:9px 18px;border-radius:999px;border:2px solid var(--ink);background:#f5faff;color:var(--ink);font-family:var(--display);font-weight:700;font-size:.8rem;letter-spacing:.14em;text-transform:uppercase;box-shadow:0 1px 0 var(--x3),0 2px 0 var(--x4),0 3px 0 var(--x5)}
+.tab[aria-selected="true"]{background:var(--aqua);transform:translateY(2px);box-shadow:0 1px 0 var(--x3)}
+.tab:focus-visible,.chip:focus-visible,.co:focus-visible{outline:3px solid var(--link);outline-offset:3px}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0 0}
+.chip{cursor:pointer;padding:5px 13px;border-radius:999px;border:2px solid rgb(var(--ink-rgb) / .45);background:rgb(255 255 255 / .55);color:var(--ink);font-family:var(--display);font-weight:500;font-size:.85rem;letter-spacing:.04em}
+.chip[aria-pressed="true"]{background:var(--aqua);border-color:var(--ink);font-weight:700}
+.panel{margin:16px 0 0;padding:16px clamp(14px,3vw,22px) 18px;border-radius:22px;border:2px solid var(--ink);background:var(--panel);box-shadow:0 1px 0 var(--x3),0 2px 0 var(--x4),0 3px 0 var(--x5),0 4px 0 var(--x6),0 16px 22px -12px rgb(var(--ink-rgb) / .35)}
+.panel h2{margin:0 0 4px;font-family:var(--display);font-weight:700;font-size:.82rem;letter-spacing:.14em;text-transform:uppercase}
+.panel .sub{margin:0 0 12px;color:var(--muted);font-size:.93rem}
+.bars{display:grid;gap:7px;max-width:44rem}
+.brow{display:grid;grid-template-columns:minmax(5.6rem,8rem) 1fr 4.8rem;gap:10px;align-items:center}
+.brow .lab{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brow .val{font-family:var(--display);font-weight:700;font-size:.85rem;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.track{position:relative;height:14px}
+.track::before{content:"";position:absolute;left:0;top:-3px;bottom:-3px;width:1.5px;background:rgb(var(--ink-rgb) / .35)}
+.fill{position:absolute;left:0;top:0;height:100%;border-radius:0 4px 4px 0;background:var(--rise)}
+.list{list-style:none;margin:0;padding:0}
+.row{display:grid;grid-template-columns:5.6rem 1fr auto;gap:4px 14px;padding:12px 0;border-top:1px solid rgb(var(--ink-rgb) / .15);align-items:start}
+.row:first-child{border-top:0}
+.row .d{font-family:var(--display);font-weight:500;font-size:.82rem;letter-spacing:.06em;color:var(--muted);padding-top:2px}
+.row .t{font-weight:600;font-size:1.02rem;min-width:0}
+.row .s{display:block;font-weight:400;color:var(--muted);font-size:.92rem;margin-top:2px}
+.row .v{font-family:var(--display);font-weight:700;font-size:1.05rem;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.tag{display:inline-block;margin-top:6px;padding:2px 9px;border-radius:999px;background:var(--butter);border:1.5px solid rgb(var(--ink-rgb) / .35);font-family:var(--display);font-weight:700;font-size:.64rem;letter-spacing:.12em;text-transform:uppercase}
+@media (max-width:560px){.row{grid-template-columns:1fr auto}.row .d{grid-column:1 / -1;padding:0}}
+.lanes{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,17rem),1fr));gap:14px;margin-top:16px}
+.lane{padding:12px 14px 14px;border-radius:18px;border:2px solid var(--ink);background:var(--panel);box-shadow:0 1px 0 var(--x3),0 2px 0 var(--x4),0 3px 0 var(--x5)}
+.lane h3{margin:0 0 10px;font-family:var(--display);font-weight:700;font-size:.82rem;letter-spacing:.14em;text-transform:uppercase}
+.cos{display:grid;gap:8px}
+.co{cursor:pointer;display:grid;grid-template-columns:1fr auto;gap:2px 10px;text-align:left;width:100%;padding:8px 10px;border-radius:12px;border:1.5px solid rgb(var(--ink-rgb) / .3);background:#fff;color:var(--ink);font:inherit}
+.co[aria-expanded="true"]{background:var(--aqua);border-color:var(--ink)}
+.co b{font-weight:600}
+.co .n{font-family:var(--display);font-weight:700;font-size:.8rem;color:var(--link);white-space:nowrap}
+.co .k{grid-column:1 / -1;height:6px;border-radius:3px;background:rgb(var(--ink-rgb) / .1);overflow:hidden}
+.co .k i{display:block;height:100%;background:var(--rise);border-radius:3px}
+.detail{margin:0;padding:10px 12px;border-radius:12px;background:rgb(var(--blue-rgb) / .12);font-size:.93rem}
+.detail p{margin:0 0 4px}.detail p:last-child{margin:0}
+.lbl{font-family:var(--display);font-weight:700;font-size:.7rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.next{margin:22px 0 0;color:var(--muted);font-size:.93rem;max-width:46rem}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+
+.row .t a{color:var(--ink);text-decoration:none}
+.row .t a:hover{text-decoration:underline;color:var(--link)}
+.empty{margin:0;padding:10px 12px;border-radius:12px;background:rgb(176 230 226 / .45);font-size:.95rem}
+.co .n.v{color:var(--ink)}
+.detail a{color:var(--link)}
+</style>
+</head><body>
+<div class="page">
+  <a class="back" href="/">&larr; Home</a>
+  <h1>Contracts &amp; Suppliers</h1>
+  <p class="sample" id="upd" style="border-style:solid"></p>
+  <div class="tabs" role="tablist" aria-label="Section">
+    <button class="tab" role="tab" id="tab-c" aria-selected="true">Contract Awards</button>
+    <button class="tab" role="tab" id="tab-s" aria-selected="false">Supplier Map</button>
+  </div>
+  <div class="chips" id="chips" role="group" aria-label="Filter by technology area"></div>
+  <div id="view"></div>
+  <p class="next" id="next"></p>
+</div>
+<script>
+var $ = function (s) { return document.querySelector(s); };
+function el(t, text, cls) { var e = document.createElement(t); if (text != null) e.textContent = text; if (cls) e.className = cls; return e; }
+function safeUrl(u) { return /^https:\/\//i.test(u || '') ? u : ''; }
+var D = { areas: [], awards: [], suppliers: {} }, view = 'c', area = 'All', open = null, polls = 0;
+
+function money(v) {
+  if (v >= 1e9) return '$' + (v / 1e9).toFixed(2) + ' B';
+  if (v >= 1e6) return '$' + (v / 1e6).toFixed(1) + ' M';
+  return '$' + Math.round(v / 1e3).toLocaleString() + ' K';
+}
+function chips() {
+  var box = $('#chips'); box.replaceChildren();
+  ['All'].concat(D.areas).forEach(function (a) {
+    var b = el('button', a, 'chip'); b.type = 'button';
+    b.setAttribute('aria-pressed', String(a === area));
+    b.onclick = function () { area = a; draw(); };
+    box.append(b);
+  });
+}
+function contracts() {
+  var rows = D.awards.filter(function (a) { return area === 'All' || a.area === area; });
+  var wrap = el('div');
+  if (!D.awards.length) { wrap.append(el('p', D.updating ? 'Collecting this month’s contract awards. This page fills in shortly.' : (D.error || 'No awards saved yet. The next update will fill this in.'), 'empty')); return wrap; }
+  var totals = {};
+  D.awards.forEach(function (a) { totals[a.area] = (totals[a.area] || 0) + a.value; });
+  var p = el('div', null, 'panel');
+  p.append(el('h2', 'Award value by area'), el('p', 'Total value of the awards listed below, last ' + D.window_days + ' days.', 'sub'));
+  var bars = el('div', null, 'bars'), max = Math.max.apply(null, Object.keys(totals).map(function (k) { return totals[k]; }));
+  D.areas.slice().sort(function (a, b) { return (totals[b] || 0) - (totals[a] || 0); }).forEach(function (k) {
+    if (!totals[k]) return;
+    var r = el('div', null, 'brow'), tr = el('div', null, 'track'), f = el('div', null, 'fill');
+    f.style.width = (totals[k] / max * 100) + '%'; tr.append(f);
+    r.append(el('span', k, 'lab'), tr, el('span', money(totals[k]), 'val'));
+    bars.append(r);
+  });
+  p.append(bars);
+  var l = el('div', null, 'panel');
+  l.append(el('h2', 'Latest awards (' + rows.length + ')'), el('p', 'Value is the total amount on the award, which can include earlier funding.', 'sub'));
+  var ul = el('ul', null, 'list');
+  rows.slice(0, 60).forEach(function (a) {
+    var li = el('li', null, 'row'), mid = el('div'), t = el('span', null, 't');
+    var u = safeUrl(a.url);
+    if (u) { var an = el('a', a.what || a.who); an.href = u; an.target = '_blank'; an.rel = 'noopener'; t.append(an); } else t.textContent = a.what || a.who;
+    mid.append(t, el('span', a.who + (a.agency ? ' · ' + a.agency : ''), 's'), el('span', a.area, 'tag'));
+    li.append(el('span', a.date, 'd'), mid, el('span', money(a.value), 'v'));
+    ul.append(li);
+  });
+  if (!rows.length) ul.append(el('li', 'No awards in this area in the last ' + D.window_days + ' days.', 'empty'));
+  l.append(ul); wrap.append(p, l);
+  return wrap;
+}
+function suppliers() {
+  var wrap = el('div', null, 'lanes');
+  if (!Object.keys(D.suppliers).length) { var e = el('p', D.updating ? 'Collecting supplier data. This page fills in shortly.' : 'No supplier data yet. It is built from the contract awards.', 'empty'); wrap.append(e); return wrap; }
+  D.areas.forEach(function (k) {
+    var list = D.suppliers[k];
+    if (!list || (area !== 'All' && area !== k)) return;
+    var lane = el('section', null, 'lane'); lane.append(el('h3', k));
+    var cos = el('div', null, 'cos'), top = Math.max.apply(null, list.map(function (c) { return c.value; }));
+    list.forEach(function (c) {
+      var id = k + '|' + c.name, b = el('button', null, 'co'); b.type = 'button';
+      b.setAttribute('aria-expanded', String(open === id));
+      b.append(el('b', c.name), el('span', money(c.value), 'n v'));
+      var bar = el('span', null, 'k'), i = el('i'); i.style.width = (c.value / top * 100) + '%'; bar.append(i); b.append(bar);
+      b.onclick = function () { open = open === id ? null : id; draw(); };
+      cos.append(b);
+      if (open === id) {
+        var d = el('div', null, 'detail');
+        var p1 = el('p'); p1.append(el('span', 'Awards ', 'lbl'), document.createTextNode(c.awards + ' in the last ' + D.window_days + ' days · in your news log ' + c.mentions + ' time' + (c.mentions === 1 ? '' : 's')));
+        var p2 = el('p'); p2.append(el('span', 'Latest ', 'lbl'));
+        var u = safeUrl(c.latest_url);
+        if (u) { var an = el('a', c.latest || 'View award'); an.href = u; an.target = '_blank'; an.rel = 'noopener'; p2.append(an); } else p2.append(document.createTextNode(c.latest));
+        d.append(p1, p2); cos.append(d);
+      }
+    });
+    lane.append(cos); wrap.append(lane);
+  });
+  return wrap;
+}
+function draw() {
+  $('#tab-c').setAttribute('aria-selected', String(view === 'c'));
+  $('#tab-s').setAttribute('aria-selected', String(view === 's'));
+  chips(); $('#view').replaceChildren(view === 'c' ? contracts() : suppliers());
+  $('#next').textContent = view === 'c'
+    ? 'Source: public US government contract data (USAspending.gov), Department of Defense awards, refreshed daily. Links open the official award record.'
+    : 'Suppliers are the top recipients of the awards above, ranked by total value. “In your news log” counts how often the name appears in saved Top 10 News headlines.';
+  $('#upd').textContent = D.updated_label ? 'Updated ' + D.updated_label : '';
+}
+function load() {
+  fetch('/api/contracts').then(function (r) { return r.json(); }).then(function (j) {
+    D = j; draw();
+    if (j.updating && !j.awards.length && polls++ < 30) setTimeout(load, 8000);
+  }).catch(function () { $('#view').replaceChildren(el('p', 'Could not load contract data.', 'empty')); });
+}
+$('#tab-c').onclick = function () { view = 'c'; draw(); };
+$('#tab-s').onclick = function () { view = 's'; draw(); };
+load();
+</script>
+</body></html>"""
+
+
 HOME = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>GW Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1782,6 +2115,24 @@ h1{margin:0 -.12em 0 0;text-align:center;font-family:var(--display);font-weight:
           </svg>
           <h2 class="title">Market Research</h2>
           <p class="sub">Find the closest published systems to your technical parameters.</p>
+          <span class="go">Open
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 2.5 10.5 8 5 13.5"/></svg>
+          </span>
+        </span>
+      </a>
+      <a class="mode" href="/contracts">
+        <span class="face">
+          <span class="sheen" aria-hidden="true"></span>
+          <svg class="glyph" viewBox="0 0 64 64" aria-hidden="true">
+            <rect x="12" y="8" width="34" height="46" rx="4" fill="#f7e7b0" stroke="#26324f" stroke-width="2.4"/>
+            <line x1="19" y1="20" x2="39" y2="20" stroke="#26324f" stroke-width="3" stroke-linecap="round"/>
+            <line x1="19" y1="29" x2="39" y2="29" stroke="#26324f" stroke-width="3" stroke-linecap="round"/>
+            <line x1="19" y1="38" x2="31" y2="38" stroke="#26324f" stroke-width="3" stroke-linecap="round"/>
+            <circle cx="46" cy="46" r="11" fill="#bfe8e3" stroke="#26324f" stroke-width="2.4"/>
+            <path d="M41 46l4 4 7-8" fill="none" stroke="#26324f" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <h2 class="title">Contracts &amp; Suppliers</h2>
+          <p class="sub">Public contract awards and who is winning the work.</p>
           <span class="go">Open
             <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 2.5 10.5 8 5 13.5"/></svg>
           </span>
@@ -2096,6 +2447,12 @@ def home():
 @app.route("/trends")
 def trends():
     return PAGE
+
+
+@app.route("/contracts")
+def contracts():
+    kick_awards()
+    return CONTRACTS_PAGE
 
 
 @app.route("/research")
