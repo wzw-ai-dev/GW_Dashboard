@@ -137,7 +137,8 @@ lock = threading.Lock()          # held while an update runs
 store_lock = threading.Lock()
 calls = {"day": "", "n": 0}
 state = {"running": False, "last_try": 0.0, "error": None, "steps": [], "store_note": ""}
-store = {"loaded": False, "days": {}, "sha": None, "branch_ok": False, "awards": [], "awards_at": 0.0}
+store = {"loaded": False, "days": {}, "sha": None, "branch_ok": False, "awards": [], "awards_at": 0.0,
+         "standards": [], "std_notes": {}}
 aw_state = {"running": False, "last_try": 0.0, "error": None}
 
 
@@ -216,7 +217,8 @@ def ensure_loaded():
         if days is None:
             obj = read_local()
             days = obj.get("days", {})
-        store.update(days=days, loaded=True, awards=obj.get("awards", []), awards_at=obj.get("awards_at", 0.0))
+        store.update(days=days, loaded=True, awards=obj.get("awards", []), awards_at=obj.get("awards_at", 0.0),
+                     standards=obj.get("standards", []), std_notes=obj.get("std_notes", {}))
         state["store_note"] = note
 
 
@@ -235,8 +237,10 @@ def ensure_branch():
     store["branch_ok"] = True
 
 
-def store_save(label):
-    payload = json.dumps({"days": store["days"], "awards": store["awards"], "awards_at": store["awards_at"]}, ensure_ascii=False, separators=(",", ":"))
+def store_save(label, message=None):
+    payload = json.dumps({"days": store["days"], "awards": store["awards"], "awards_at": store["awards_at"],
+                          "standards": store["standards"], "std_notes": store["std_notes"]},
+                         ensure_ascii=False, separators=(",", ":"))
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             f.write(payload)
@@ -248,7 +252,7 @@ def store_save(label):
     try:
         ensure_branch()
         for attempt_no in range(2):
-            body = {"message": "Daily news snapshot " + label, "branch": GH_BRANCH,
+            body = {"message": message or ("Daily news snapshot " + label), "branch": GH_BRANCH,
                     "content": base64.b64encode(payload.encode("utf-8")).decode()}
             if store["sha"]:
                 body["sha"] = store["sha"]
@@ -1314,6 +1318,471 @@ def research_status():
                                   "log": RS["log"].get(t)} for t in RESEARCH_TYPES}})
 
 
+# =============================================================================
+# Standards library: free, publicly released standards only.
+# Paid standards (ISO, IEEE, SAE, IPC...) are not hosted here. Summaries are
+# written for this app; the documents themselves are fetched from the official,
+# free sources linked on each card. Revision letters are left out on purpose:
+# the official source always shows the current revision.
+# =============================================================================
+STD_SOURCES = {
+    "DoD": {"name": "US DoD · ASSIST", "url": "https://quicksearch.dla.mil/qsSearch.aspx",
+            "how": "Search the number in ASSIST Quick Search. Documents cleared for public release download free."},
+    "NASA": {"name": "NASA Technical Standards", "url": "https://standards.nasa.gov/",
+             "how": "Search the number on the NASA Technical Standards site. Free download."},
+    "ECSS": {"name": "ESA · ECSS", "url": "https://ecss.nl/",
+             "how": "Free download from the ECSS site after a free registration."},
+}
+STD_AREAS = ["Environment & test", "EMC / E3", "Munition & fuze safety", "Interfaces & power",
+             "Reliability & safety", "Parts & workmanship", "Structures", "Marking & data", "Modelling & simulation"]
+
+# number, source, kind, area, title, what it is for, status note ("" if none)
+_STD = [
+    ("MIL-STD-810", "DoD", "Standard", "Environment & test",
+     "Environmental Engineering Considerations and Laboratory Tests",
+     "The reference for tailoring environmental life-cycle profiles and lab tests: vibration, shock, temperature, humidity, altitude, sand and dust, salt fog, gunfire shock and more.", ""),
+    ("MIL-HDBK-310", "DoD", "Handbook", "Environment & test",
+     "Global Climatic Data for Developing Military Products",
+     "Climatic extremes (temperature, humidity, solar, wind, rain) to use when setting design and test requirements.", ""),
+    ("MIL-STD-331", "DoD", "Test method", "Munition & fuze safety",
+     "Fuze and Fuze Components, Environmental and Performance Tests for",
+     "Test methods used to show a fuze survives its environments and still performs, including jolt, jumble and drop tests.", ""),
+    ("MIL-STD-1316", "DoD", "Standard", "Munition & fuze safety",
+     "Safety Criteria for Fuze Design",
+     "Design safety rules for fuzes: independent safety features, arming environments, arming distance and failure-rate goals.", ""),
+    ("MIL-STD-1901", "DoD", "Standard", "Munition & fuze safety",
+     "Munition Rocket and Missile Motor Ignition System Design, Safety Criteria for",
+     "Safety design criteria for rocket and missile motor ignition systems, including in-line and out-of-line ignition.", ""),
+    ("MIL-STD-2105", "DoD", "Test method", "Munition & fuze safety",
+     "Hazard Assessment Tests for Non-Nuclear Munitions",
+     "Insensitive-munition and hazard tests: fast and slow cook-off, bullet and fragment impact, sympathetic reaction, drop.", ""),
+    ("MIL-STD-1751", "DoD", "Test method", "Munition & fuze safety",
+     "Safety and Performance Tests for the Qualification of Explosives",
+     "Tests used to qualify a new explosive (sensitivity, thermal stability, compatibility) before it goes into a munition.", ""),
+    ("MIL-HDBK-1512", "DoD", "Handbook", "Munition & fuze safety",
+     "Electroexplosive Subsystems, Electrically Initiated, Design Requirements and Test Methods",
+     "Design and test guidance for electrically initiated explosive subsystems such as squibs, initiators and firing circuits.", ""),
+    ("MIL-STD-1576", "DoD", "Standard", "Munition & fuze safety",
+     "Electroexplosive Subsystem Safety Requirements and Test Methods for Space Systems",
+     "Safety requirements and tests for electroexplosive subsystems on launch vehicles and spacecraft.", ""),
+    ("MIL-STD-461", "DoD", "Standard", "EMC / E3",
+     "Requirements for the Control of Electromagnetic Interference Characteristics of Subsystems and Equipment",
+     "Conducted and radiated emission and susceptibility limits and test methods (CE, CS, RE, RS) for equipment.", ""),
+    ("MIL-STD-464", "DoD", "Standard", "EMC / E3",
+     "Electromagnetic Environmental Effects Requirements for Systems",
+     "System-level E3: lightning, EMP, HERO (ordnance in RF fields), ESD, intra-system compatibility and external RF environments.", ""),
+    ("MIL-STD-1553", "DoD", "Standard", "Interfaces & power",
+     "Digital Time Division Command/Response Multiplex Data Bus",
+     "The classic dual-redundant 1 Mbit/s avionics data bus used between aircraft, stores and subsystems.", ""),
+    ("MIL-STD-1760", "DoD", "Standard", "Interfaces & power",
+     "Aircraft/Store Electrical Interconnection System",
+     "The electrical interface between aircraft and smart stores: connectors, power, discretes, data bus and release consent.", ""),
+    ("MIL-STD-8591", "DoD", "Standard", "Interfaces & power",
+     "Airborne Stores, Suspension Equipment and Aircraft-Store Interface (Carriage Phase)",
+     "Mechanical and environmental design requirements for stores and racks during captive carriage.", ""),
+    ("MIL-STD-704", "DoD", "Standard", "Interfaces & power",
+     "Aircraft Electric Power Characteristics",
+     "Normal, abnormal and emergency limits of aircraft AC and DC power that equipment must tolerate.", ""),
+    ("MIL-STD-1275", "DoD", "Standard", "Interfaces & power",
+     "Characteristics of 28 Volt DC Input Power to Utilization Equipment in Military Vehicles",
+     "Steady-state, surge and spike limits for 28 V DC ground-vehicle power, relevant to vehicle-mounted launchers.", ""),
+    ("MIL-STD-1399", "DoD", "Standard", "Interfaces & power",
+     "Interface Standard for Shipboard Systems",
+     "A multi-section standard for ship interfaces; Section 300 covers shipboard electric power for equipment.", ""),
+    ("MIL-STD-882", "DoD", "Standard", "Reliability & safety",
+     "System Safety",
+     "The DoD process for identifying hazards, assessing risk (severity x probability) and tracking mitigations over the life cycle.", ""),
+    ("MIL-HDBK-217", "DoD", "Handbook", "Reliability & safety",
+     "Reliability Prediction of Electronic Equipment",
+     "Part-count and part-stress failure-rate models for electronics.", "Old and not updated for modern parts, but still widely cited."),
+    ("MIL-HDBK-338", "DoD", "Handbook", "Reliability & safety",
+     "Electronic Reliability Design Handbook",
+     "Broad guidance on reliability engineering: allocation, derating, FMECA, testing and growth.", ""),
+    ("MIL-STD-1629", "DoD", "Standard", "Reliability & safety",
+     "Procedures for Performing a Failure Mode, Effects and Criticality Analysis",
+     "The classic FMECA method and worksheets.", "Cancelled, but still widely referenced in contracts and practice."),
+    ("MIL-STD-1472", "DoD", "Standard", "Reliability & safety",
+     "Human Engineering",
+     "Human-factors design criteria for controls, displays, labelling, maintainability and workspace.", ""),
+    ("MIL-STD-1916", "DoD", "Standard", "Reliability & safety",
+     "DoD Preferred Methods for Acceptance of Product",
+     "Sampling and process-control based methods for accepting delivered product.", ""),
+    ("MIL-STD-202", "DoD", "Test method", "Parts & workmanship",
+     "Electronic and Electrical Component Parts",
+     "Environmental, physical and electrical test methods for components such as resistors, capacitors and relays.", ""),
+    ("MIL-STD-883", "DoD", "Test method", "Parts & workmanship",
+     "Test Method Standard: Microcircuits",
+     "Screening and qualification tests for microcircuits: burn-in, temperature cycling, hermeticity, die shear and more.", ""),
+    ("MIL-HDBK-263", "DoD", "Handbook", "Parts & workmanship",
+     "Electrostatic Discharge Control Handbook",
+     "Guidance on ESD-sensitive items and how to protect them in design, handling and packaging.", ""),
+    ("MIL-HDBK-1823", "DoD", "Handbook", "Parts & workmanship",
+     "Nondestructive Evaluation System Reliability Assessment",
+     "How to measure probability of detection (POD) for NDE methods used on structures and parts.", ""),
+    ("MIL-STD-130", "DoD", "Standard", "Marking & data",
+     "Identification Marking of U.S. Military Property",
+     "Item marking and unique identification (UID / 2D data matrix) rules.", ""),
+    ("MIL-STD-129", "DoD", "Standard", "Marking & data",
+     "Military Marking for Shipment and Storage",
+     "Labels and markings for packages and unit loads, including bar codes and hazardous-material markings.", ""),
+    ("MIL-STD-1168", "DoD", "Standard", "Marking & data",
+     "Department of Defense Ammunition Lot Numbering and Ammunition Data Card",
+     "How ammunition and explosive lots are numbered and documented.", ""),
+    ("MIL-STD-31000", "DoD", "Standard", "Marking & data",
+     "Technical Data Packages",
+     "What goes into a technical data package: drawings, 3D models, specifications and associated lists.", ""),
+    ("MIL-STD-3022", "DoD", "Standard", "Modelling & simulation",
+     "Documentation of Verification, Validation, and Accreditation (VV&A) for Models and Simulations",
+     "Templates for documenting VV&A of models and simulations, useful for flight and seeker simulations.", ""),
+    ("NASA-STD-5001", "NASA", "Standard", "Structures",
+     "Structural Design and Test Factors of Safety for Spaceflight Hardware",
+     "Minimum design and test factors of safety for metallic, composite and other structures.", ""),
+    ("NASA-STD-5019", "NASA", "Standard", "Structures",
+     "Fracture Control Requirements for Spaceflight Hardware",
+     "Fracture control: classifying parts, damage tolerance and NDE requirements.", ""),
+    ("NASA-STD-7001", "NASA", "Standard", "Environment & test",
+     "Payload Vibroacoustic Test Criteria",
+     "Minimum random vibration and acoustic test levels and durations for flight hardware.", ""),
+    ("NASA-STD-7003", "NASA", "Standard", "Environment & test",
+     "Pyroshock Test Criteria",
+     "How to set pyroshock test levels and run the tests, useful wherever stage separation or ordnance shocks occur.", ""),
+    ("NASA-HDBK-7005", "NASA", "Handbook", "Environment & test",
+     "Dynamic Environmental Criteria",
+     "Deriving vibration, acoustic and shock environments from flight data and predictions.", ""),
+    ("NASA-STD-6016", "NASA", "Standard", "Parts & workmanship",
+     "Standard Materials and Processes Requirements for Spacecraft",
+     "Materials and processes requirements: flammability, outgassing, stress-corrosion and fluid compatibility.", ""),
+    ("NASA-STD-8739.4", "NASA", "Standard", "Parts & workmanship",
+     "Workmanship Standard for Crimping, Interconnecting Cables, Harnesses, and Wiring",
+     "Workmanship rules for crimps, cables and harness builds, with acceptance criteria.", ""),
+    ("ECSS-E-ST-10-03", "ECSS", "Standard", "Environment & test",
+     "Space Engineering: Testing",
+     "European test requirements for qualification and acceptance of space products, with test levels and margins.", ""),
+    ("ECSS-E-ST-32", "ECSS", "Standard", "Structures",
+     "Space Engineering: Structural General Requirements",
+     "Structural design, analysis and verification requirements, including factors of safety.", ""),
+]
+STANDARDS = [{"num": n, "source": src, "kind": k, "area": a, "title": t, "summary": su, "status": st}
+             for n, src, k, a, t, su, st in _STD]
+STD_KINDS = ["Standard", "Handbook", "Test method", "Specification", "Guide"]
+
+
+def std_key(num):
+    return re.sub(r"[^A-Z0-9.]", "", (num or "").upper())
+
+
+def std_all():
+    ensure_loaded()
+    rows = [dict(s, custom=False) for s in STANDARDS] + [dict(s, custom=True) for s in store["standards"]]
+    for s in rows:
+        s["note"] = store["std_notes"].get(std_key(s["num"]), "")
+    return rows
+
+
+def std_text(d, k, limit, required=False):
+    v = re.sub(r"\s+", " ", str(d.get(k) or "")).strip()
+    if required and not v:
+        raise ValueError("Please fill in " + k + ".")
+    if len(v) > limit:
+        raise ValueError("%s is too long (max %d characters)." % (k.capitalize(), limit))
+    return v
+
+
+@app.route("/api/standards", methods=["GET"])
+def standards_api():
+    return jsonify({"standards": std_all(), "areas": STD_AREAS, "kinds": STD_KINDS, "sources": STD_SOURCES,
+                    "persistent": bool(GH_TOKEN and GH_REPO)})
+
+
+@app.route("/api/standards", methods=["POST"])
+def standards_edit():
+    # JSON only: a plain HTML form on another site cannot send this content type without a CORS check.
+    if not request.is_json:
+        return jsonify({"error": "Send JSON."}), 415
+    d = request.get_json(silent=True) or {}
+    ensure_loaded()
+    try:
+        act = d.get("action")
+        if act == "note":
+            key = std_key(d.get("num"))
+            if not key or key not in {std_key(s["num"]) for s in std_all()}:
+                raise ValueError("Unknown standard.")
+            note = str(d.get("note") or "").strip()
+            if len(note) > 1500:
+                raise ValueError("Notes are limited to 1500 characters.")
+            with store_lock:
+                if note:
+                    store["std_notes"][key] = note
+                else:
+                    store["std_notes"].pop(key, None)
+            msg = "Standards note " + key
+        elif act == "add":
+            num = std_text(d, "num", 40, True)
+            if std_key(num) in {std_key(s["num"]) for s in std_all()}:
+                raise ValueError(num + " is already in the library.")
+            area = std_text(d, "area", 40, True)
+            if area not in STD_AREAS:
+                raise ValueError("Pick an area from the list.")
+            kind = std_text(d, "kind", 20) or "Standard"
+            if kind not in STD_KINDS:
+                raise ValueError("Pick a type from the list.")
+            link = std_text(d, "link", 300)
+            if link and not re.match(r"^https://[^\s/]+\.[^\s]+$", link):
+                raise ValueError("The link must be a full https:// address.")
+            entry = {"num": num, "source": std_text(d, "source", 40) or "Other", "kind": kind, "area": area,
+                     "title": std_text(d, "title", 200, True), "summary": std_text(d, "summary", 400),
+                     "status": "", "link": link, "added": time.time()}
+            with store_lock:
+                if len(store["standards"]) >= 500:
+                    raise ValueError("The library is full (500 added standards).")
+                store["standards"].append(entry)
+            msg = "Standards: add " + num
+        elif act == "delete":
+            key = std_key(d.get("num"))
+            with store_lock:
+                before = len(store["standards"])
+                store["standards"] = [s for s in store["standards"] if std_key(s["num"]) != key]
+                if len(store["standards"]) == before:
+                    raise ValueError("Only standards added by your team can be removed.")
+                store["std_notes"].pop(key, None)
+            msg = "Standards: remove " + key
+        else:
+            raise ValueError("Unknown action.")
+    except ValueError as ex:
+        return jsonify({"error": str(ex)}), 400
+    store_save("standards", msg)
+    return jsonify({"ok": True, "storage": state["store_note"], "standards": std_all()})
+
+
+STANDARDS_PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Standards Library</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Jost:wght@500;700&family=Zilla+Slab:ital,wght@0,400;0,600;1,400&display=swap">
+<style>
+/* Layout: one column in the pastel-blue dashboard style; search box and filter chips, then a grid of standard cards with team notes. */
+:root{
+  color-scheme:light;
+  --bg:#dcebfa; --ink:#26324f; --muted:#52638a; --panel:#fcfcfb;
+  --aqua:#bfe8e3; --butter:#f7e7b0; --peri:#b3bff2; --peach:#f4b8a4; --blue:#6f8be0; --link:#2f4fa2;
+  --ink-rgb:38 50 79; --blue-rgb:111 139 224;
+  --x3:color-mix(in srgb,var(--blue) 64%,var(--ink)); --x4:color-mix(in srgb,var(--blue) 56%,var(--ink));
+  --x5:color-mix(in srgb,var(--blue) 48%,var(--ink)); --x6:color-mix(in srgb,var(--blue) 40%,var(--ink));
+  --display:"Jost","Futura","Century Gothic",system-ui,sans-serif;
+  --body:"Zilla Slab","Archer","Rockwell",Georgia,serif;
+}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;padding-inline:16px;padding-block:24px 56px;background:radial-gradient(60% 45% at 12% 4%,rgb(150 160 240 / .45),transparent 70%),radial-gradient(55% 40% at 94% 98%,rgb(176 230 226 / .8),transparent 70%),var(--bg);background-attachment:fixed;color:var(--ink);font-family:var(--body);font-size:16px;line-height:1.45}
+button,input,select,textarea{font:inherit;color:inherit}
+.page{max-width:68rem;margin:0 auto;min-width:0}
+.back{display:inline-block;color:var(--link);font-family:var(--display);font-weight:500;font-size:.95rem;letter-spacing:.06em;text-decoration:none;margin-bottom:6px}
+h1{margin:0;font-family:var(--display);font-weight:700;font-size:clamp(1.6rem,7vw,3rem);letter-spacing:.1em;text-transform:uppercase;line-height:1.1;text-shadow:3px 3px 0 var(--blue);text-wrap:balance}
+.lede{margin:12px 0 0;max-width:48rem;color:var(--muted);font-size:1.05rem}
+.search{margin:18px 0 0;display:flex;gap:10px;flex-wrap:wrap}
+.search input{flex:1 1 16rem;min-width:0;padding:11px 14px;border:2px solid var(--ink);border-radius:14px;background:#fff;font-size:1.05rem}
+.btn{cursor:pointer;padding:9px 18px;border-radius:999px;border:2px solid var(--ink);background:var(--aqua);font-family:var(--display);font-weight:700;font-size:.78rem;letter-spacing:.14em;text-transform:uppercase;box-shadow:0 1px 0 var(--x3),0 2px 0 var(--x4),0 3px 0 var(--x5)}
+.btn.alt{background:#f5faff}
+.btn.sm{padding:5px 12px;font-size:.68rem}
+.btn:active{transform:translateY(2px);box-shadow:0 1px 0 var(--x3)}
+.btn[disabled]{opacity:.6;cursor:progress}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0}
+.chips .lbl{align-self:center;font-family:var(--display);font-weight:700;font-size:.7rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-right:2px}
+.chip{cursor:pointer;padding:5px 13px;border-radius:999px;border:2px solid rgb(var(--ink-rgb) / .45);background:rgb(255 255 255 / .55);font-family:var(--display);font-weight:500;font-size:.85rem;letter-spacing:.04em}
+.chip[aria-pressed="true"]{background:var(--aqua);border-color:var(--ink);font-weight:700}
+.chip .n{color:var(--muted);font-size:.78rem;margin-left:5px}
+.btn:focus-visible,.chip:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,a:focus-visible,summary:focus-visible{outline:3px solid var(--link);outline-offset:2px}
+.count{margin:14px 0 0;color:var(--muted);font-size:.95rem}
+.grid{list-style:none;margin:12px 0 0;padding:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,19rem),1fr));gap:18px}
+.card{display:flex;flex-direction:column;gap:8px;height:100%;padding:14px 16px 14px;border-radius:20px;border:2px solid var(--ink);background:var(--panel);box-shadow:0 1px 0 var(--x3),0 2px 0 var(--x4),0 3px 0 var(--x5),0 4px 0 var(--x6),0 14px 20px -12px rgb(var(--ink-rgb) / .35);min-width:0}
+.num{margin:0;font-family:var(--display);font-weight:700;font-size:1.25rem;letter-spacing:.04em;overflow-wrap:anywhere}
+.ttl{margin:0;font-weight:600;font-size:1rem;line-height:1.3}
+.tags{display:flex;flex-wrap:wrap;gap:6px}
+.tag{padding:2px 9px;border-radius:999px;border:1.5px solid rgb(var(--ink-rgb) / .35);font-family:var(--display);font-weight:700;font-size:.62rem;letter-spacing:.11em;text-transform:uppercase;background:var(--butter)}
+.tag.src{background:var(--peri)}
+.tag.own{background:var(--peach)}
+.sum{margin:0;font-size:.95rem;color:var(--ink)}
+.status{margin:0;padding:6px 9px;border-radius:10px;background:rgb(244 184 164 / .45);font-size:.88rem}
+.acts{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:auto;padding-top:4px}
+.acts a{color:var(--link);font-family:var(--display);font-weight:500;font-size:.88rem;letter-spacing:.04em}
+.how{margin:0;color:var(--muted);font-size:.82rem}
+details.notes{border-top:1px solid rgb(var(--ink-rgb) / .15);padding-top:8px}
+details.notes summary{cursor:pointer;font-family:var(--display);font-weight:700;font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+details.notes[data-has="1"] summary{color:var(--link)}
+.notes textarea{width:100%;min-height:5.5rem;margin-top:8px;padding:8px 10px;border:2px solid rgb(var(--ink-rgb) / .5);border-radius:12px;background:#fff;font-size:.95rem;resize:vertical}
+.notes .row{display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap}
+.notes .msg{color:var(--muted);font-size:.85rem}
+.panel{margin:22px 0 0;padding:16px clamp(14px,3vw,22px) 18px;border-radius:22px;border:2px solid var(--ink);background:var(--panel);box-shadow:0 1px 0 var(--x3),0 2px 0 var(--x4),0 3px 0 var(--x5),0 4px 0 var(--x6)}
+.panel summary{cursor:pointer;font-family:var(--display);font-weight:700;font-size:.85rem;letter-spacing:.14em;text-transform:uppercase}
+.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,13rem),1fr));gap:12px 14px;margin-top:14px}
+.fld{display:grid;gap:5px;min-width:0}
+.fld.wide{grid-column:1 / -1}
+.fld>span{font-family:var(--display);font-weight:700;font-size:.7rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.fld input,.fld select,.fld textarea{width:100%;min-width:0;padding:9px 11px;border:2px solid var(--ink);border-radius:12px;background:#fff;font-size:1rem}
+.fld textarea{min-height:4.5rem;resize:vertical}
+.err{color:#8a2d2d}
+.empty{margin:0;padding:10px 12px;border-radius:12px;background:rgb(176 230 226 / .45);font-size:.95rem}
+.foot{margin:24px 0 0;max-width:52rem;color:var(--muted);font-size:.9rem}
+.foot a{color:var(--link)}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head><body>
+<div class="page">
+  <a class="back" href="/">&larr; Home</a>
+  <h1>Standards Library</h1>
+  <p class="lede">Free, publicly released standards that guided-weapon engineers use most. Each card says what the standard is for and where to download it from the official source. Add your own and keep team notes on any of them.</p>
+
+  <div class="search">
+    <input id="q" type="search" placeholder="Search number, title or topic, e.g. 810, vibration, fuze, 1553" aria-label="Search standards" autocomplete="off">
+  </div>
+  <div class="chips" id="areas" role="group" aria-label="Filter by area"></div>
+  <div class="chips" id="srcs" role="group" aria-label="Filter by source"></div>
+  <p class="count" id="count" aria-live="polite"></p>
+  <ul class="grid" id="grid"></ul>
+
+  <details class="panel" id="addp">
+    <summary>Add a standard</summary>
+    <form id="addf" novalidate>
+      <div class="fields">
+        <label class="fld"><span>Number *</span><input id="a-num" maxlength="40" placeholder="e.g. MIL-STD-1474"></label>
+        <label class="fld"><span>Area *</span><select id="a-area"></select></label>
+        <label class="fld"><span>Type</span><select id="a-kind"></select></label>
+        <label class="fld"><span>Issued by</span><input id="a-src" maxlength="40" placeholder="e.g. DoD, NASA, NATO"></label>
+        <label class="fld wide"><span>Title *</span><input id="a-title" maxlength="200"></label>
+        <label class="fld wide"><span>What it is for</span><textarea id="a-sum" maxlength="400" placeholder="One or two sentences in your own words"></textarea></label>
+        <label class="fld wide"><span>Link to the free official copy (https)</span><input id="a-link" maxlength="300" placeholder="https://"></label>
+      </div>
+      <p class="how">Only add standards that are free and publicly released. Do not upload or link copies of paid standards.</p>
+      <div class="acts"><button class="btn" type="submit" id="a-go">Add to library</button><span id="a-msg" class="how" aria-live="polite"></span></div>
+    </form>
+  </details>
+
+  <p class="foot" id="foot"></p>
+</div>
+<script>
+var $ = function (s) { return document.querySelector(s); };
+function el(t, text, cls) { var e = document.createElement(t); if (text != null) e.textContent = text; if (cls) e.className = cls; return e; }
+function safeUrl(u) { return /^https:\/\//i.test(u || '') ? u : ''; }
+var D = { standards: [], areas: [], kinds: [], sources: {} }, area = 'All', src = 'All', openNotes = {};
+
+function post(body) {
+  return fetch('/api/standards', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || 'Something went wrong.'); return j; }); });
+}
+function srcOf(s) { return s.custom ? 'Added by team' : s.source; }
+function matches(s, words) {
+  var hay = [s.num, s.title, s.summary, s.area, s.kind, s.source, s.note, s.num.replace(/[^0-9.]/g, '')].join(' ').toLowerCase();
+  return words.every(function (w) { return hay.indexOf(w) >= 0; });
+}
+function chipRow(box, label, list, current, set) {
+  box.replaceChildren(el('span', label, 'lbl'));
+  list.forEach(function (p) {
+    var b = el('button', null, 'chip'); b.type = 'button';
+    b.setAttribute('aria-pressed', String(p[0] === current));
+    b.append(document.createTextNode(p[0]), el('span', String(p[1]), 'n'));
+    b.onclick = function () { set(p[0]); draw(); };
+    box.append(b);
+  });
+}
+function card(s) {
+  var li = el('li'), c = el('article', null, 'card');
+  c.append(el('h2', s.num, 'num'), el('p', s.title, 'ttl'));
+  var tags = el('div', null, 'tags');
+  tags.append(el('span', s.area, 'tag'), el('span', s.kind, 'tag'), el('span', srcOf(s), 'tag ' + (s.custom ? 'own' : 'src')));
+  c.append(tags);
+  if (s.summary) c.append(el('p', s.summary, 'sum'));
+  if (s.status) c.append(el('p', s.status, 'status'));
+  var info = D.sources[s.source];
+  if (info && !s.custom) c.append(el('p', info.how, 'how'));
+  var acts = el('div', null, 'acts');
+  var u = safeUrl(s.link) || (info && !s.custom ? info.url : '');
+  if (u) { var a = el('a', s.custom ? 'Open link' : 'Find on ' + info.name); a.href = u; a.target = '_blank'; a.rel = 'noopener'; acts.append(a); }
+  var cp = el('button', 'Copy number', 'btn alt sm'); cp.type = 'button';
+  cp.onclick = function () {
+    (navigator.clipboard ? navigator.clipboard.writeText(s.num) : Promise.reject()).then(function () { cp.textContent = 'Copied'; }, function () { cp.textContent = s.num; });
+    setTimeout(function () { cp.textContent = 'Copy number'; }, 1600);
+  };
+  acts.append(cp);
+  if (s.custom) {
+    var del = el('button', 'Remove', 'btn alt sm'); del.type = 'button';
+    del.onclick = function () {
+      if (!confirm('Remove ' + s.num + ' from the library? Its notes are removed too.')) return;
+      del.disabled = true;
+      post({ action: 'delete', num: s.num }).then(function (j) { D.standards = j.standards; draw(); }, function (e) { del.disabled = false; alert(e.message); });
+    };
+    acts.append(del);
+  }
+  c.append(acts);
+
+  var det = el('details', null, 'notes');
+  det.dataset.has = s.note ? '1' : '0';
+  det.open = !!openNotes[s.num];
+  det.ontoggle = function () { openNotes[s.num] = det.open; };
+  det.append(el('summary', s.note ? 'Team notes ●' : 'Team notes'));
+  var ta = el('textarea'); ta.value = s.note || ''; ta.maxLength = 1500;
+  ta.setAttribute('aria-label', 'Team notes for ' + s.num);
+  ta.placeholder = 'Which revision your programme uses, tailoring decisions, useful sections…';
+  var row = el('div', null, 'row'), save = el('button', 'Save note', 'btn sm'), msg = el('span', '', 'msg');
+  save.type = 'button';
+  save.onclick = function () {
+    save.disabled = true; msg.textContent = 'Saving…'; msg.className = 'msg';
+    post({ action: 'note', num: s.num, note: ta.value }).then(function (j) {
+      save.disabled = false; msg.textContent = 'Saved';
+      s.note = ta.value.trim(); det.dataset.has = s.note ? '1' : '0';
+      det.querySelector('summary').textContent = s.note ? 'Team notes ●' : 'Team notes';
+      D.standards = j.standards;
+    }, function (e) { save.disabled = false; msg.textContent = e.message; msg.className = 'msg err'; });
+  };
+  row.append(save, msg);
+  det.append(ta, row);
+  c.append(det);
+  li.append(c);
+  return li;
+}
+function draw() {
+  var words = $('#q').value.toLowerCase().split(/\s+/).filter(Boolean);
+  var bySearch = D.standards.filter(function (s) { return matches(s, words); });
+  function counts(key, list) { var c = {}; list.forEach(function (s) { var k = key(s); c[k] = (c[k] || 0) + 1; }); return c; }
+  var inSrc = bySearch.filter(function (s) { return src === 'All' || srcOf(s) === src; });
+  var ac = counts(function (s) { return s.area; }, inSrc);
+  chipRow($('#areas'), 'Area', [['All', inSrc.length]].concat(D.areas.filter(function (a) { return ac[a]; }).map(function (a) { return [a, ac[a]]; })), area, function (v) { area = v; });
+  var inArea = bySearch.filter(function (s) { return area === 'All' || s.area === area; });
+  var sc = counts(srcOf, inArea);
+  chipRow($('#srcs'), 'Source', [['All', inArea.length]].concat(Object.keys(sc).sort().map(function (k) { return [k, sc[k]]; })), src, function (v) { src = v; });
+  var rows = inArea.filter(function (s) { return src === 'All' || srcOf(s) === src; });
+  rows.sort(function (a, b) { return a.area.localeCompare(b.area) || a.num.localeCompare(b.num, undefined, { numeric: true }); });
+  var g = $('#grid'); g.replaceChildren();
+  rows.forEach(function (s) { g.append(card(s)); });
+  $('#count').textContent = rows.length ? 'Showing ' + rows.length + ' of ' + D.standards.length + ' standards' : '';
+  if (!rows.length) g.append(el('li', 'No standards match. Try a different word, clear the filters, or add it below.', 'empty'));
+}
+function fill(id, list) { var s = $(id); s.replaceChildren(); list.forEach(function (v) { var o = el('option', v); o.value = v; s.append(o); }); }
+function load() {
+  fetch('/api/standards').then(function (r) { return r.json(); }).then(function (j) {
+    D = j; fill('#a-area', j.areas); fill('#a-kind', j.kinds); draw();
+    $('#foot').textContent = 'Paid standards (ISO, IEEE, SAE and similar) are not hosted here. Summaries are written for this tool; always work from the official document and check its current revision at the source.' +
+      (j.persistent ? '' : ' Note: GitHub storage is not set up, so added standards and notes may be lost when the host restarts.');
+  }).catch(function () { $('#count').textContent = 'Could not load the library.'; });
+}
+var t = null;
+$('#q').addEventListener('input', function () { clearTimeout(t); t = setTimeout(draw, 120); });
+$('#addf').addEventListener('submit', function (e) {
+  e.preventDefault();
+  var b = $('#a-go'), m = $('#a-msg');
+  b.disabled = true; m.textContent = 'Adding…'; m.className = 'how';
+  post({ action: 'add', num: $('#a-num').value, area: $('#a-area').value, kind: $('#a-kind').value, source: $('#a-src').value,
+         title: $('#a-title').value, summary: $('#a-sum').value, link: $('#a-link').value })
+    .then(function (j) {
+      b.disabled = false; m.textContent = 'Added.'; D.standards = j.standards;
+      ['#a-num', '#a-src', '#a-title', '#a-sum', '#a-link'].forEach(function (id) { $(id).value = ''; });
+      area = 'All'; src = 'All'; draw();
+    }, function (err) { b.disabled = false; m.textContent = err.message; m.className = 'how err'; });
+});
+load();
+</script>
+</body></html>"""
+
+
 PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Top 10 News</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -2138,6 +2607,24 @@ h1{margin:0 -.12em 0 0;text-align:center;font-family:var(--display);font-weight:
           </span>
         </span>
       </a>
+      <a class="mode" href="/standards">
+        <span class="face">
+          <span class="sheen" aria-hidden="true"></span>
+          <svg class="glyph" viewBox="0 0 64 64" aria-hidden="true">
+            <rect x="8" y="12" width="14" height="44" rx="2" fill="#b3bff2" stroke="#26324f" stroke-width="2.4"/>
+            <rect x="25" y="8" width="14" height="48" rx="2" fill="#bfe8e3" stroke="#26324f" stroke-width="2.4"/>
+            <rect x="42" y="16" width="14" height="40" rx="2" fill="#f7e7b0" stroke="#26324f" stroke-width="2.4" transform="rotate(8 49 36)"/>
+            <line x1="11" y1="22" x2="19" y2="22" stroke="#26324f" stroke-width="2.4" stroke-linecap="round"/>
+            <line x1="28" y1="18" x2="36" y2="18" stroke="#26324f" stroke-width="2.4" stroke-linecap="round"/>
+            <circle cx="32" cy="44" r="3.5" fill="#f4b8a4" stroke="#26324f" stroke-width="2"/>
+          </svg>
+          <h2 class="title">Standards Library</h2>
+          <p class="sub">Free military and space standards, with team notes.</p>
+          <span class="go">Open
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 2.5 10.5 8 5 13.5"/></svg>
+          </span>
+        </span>
+      </a>
     </div>
   </main>
 </div>
@@ -2459,6 +2946,11 @@ def contracts():
 def research():
     request_types(list(RESEARCH_TYPES), front=False)  # start loading data in the background
     return RESEARCH_PAGE
+
+
+@app.route("/standards")
+def standards():
+    return STANDARDS_PAGE
 
 
 if __name__ == "__main__":
