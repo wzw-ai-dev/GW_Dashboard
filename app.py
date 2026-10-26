@@ -137,9 +137,8 @@ lock = threading.Lock()          # held while an update runs
 store_lock = threading.Lock()
 calls = {"day": "", "n": 0}
 state = {"running": False, "last_try": 0.0, "error": None, "steps": [], "store_note": ""}
-store = {"loaded": False, "days": {}, "sha": None, "branch_ok": False, "awards": [], "awards_at": 0.0,
+store = {"loaded": False, "days": {}, "sha": None, "branch_ok": False,
          "standards": [], "std_notes": {}, "std_digests": {}}
-aw_state = {"running": False, "last_try": 0.0, "error": None}
 
 
 def tz():
@@ -220,8 +219,7 @@ def ensure_loaded():
         if days is None:
             obj = read_local()
             days = obj.get("days", {})
-        store.update(days=days, loaded=True, awards=obj.get("awards", []), awards_at=obj.get("awards_at", 0.0),
-                     standards=obj.get("standards", []), std_notes=obj.get("std_notes", {}),
+        store.update(days=days, loaded=True, standards=obj.get("standards", []), std_notes=obj.get("std_notes", {}),
                      std_digests=obj.get("std_digests", {}))
         state["store_note"] = note
 
@@ -242,7 +240,7 @@ def ensure_branch():
 
 
 def store_save(label, message=None):
-    payload = json.dumps({"days": store["days"], "awards": store["awards"], "awards_at": store["awards_at"],
+    payload = json.dumps({"days": store["days"],
                           "standards": store["standards"], "std_notes": store["std_notes"],
                           "std_digests": store["std_digests"]},
                          ensure_ascii=False, separators=(",", ":"))
@@ -459,7 +457,6 @@ def run_update():
                     d["items"] = slim(d["items"])
         store_save(slot)
         state["error"] = None
-        threading.Thread(target=run_awards, daemon=True).start()
         return True
     except Exception as ex:
         state["error"] = "Update failed: " + str(ex)[:80]
@@ -547,148 +544,6 @@ def compute_trends():
                     "lead": d["items"][0]["title"] if d["items"] else ""})
     return {"dates": keys, "days": n, "topics": topics, "terms": terms[:8], "log": log,
             "recent_days": k}
-
-
-# ---- Contract awards (public US government data, USAspending.gov) ----
-AREA_KEYWORDS = {
-    "Sensors & optics": ["infrared sensor", "electro-optical", "radar", "thermal imaging"],
-    "Communications": ["tactical radio", "satellite communications", "data link", "antenna"],
-    "Software & AI": ["software development", "machine learning", "modeling and simulation"],
-    "Materials": ["composite", "titanium", "ceramic", "coating"],
-    "Power & propulsion": ["turbine engine", "propulsion", "battery", "power generation"],
-    "Test services": ["test and evaluation", "calibration", "environmental testing", "range support"],
-    "Manufacturing": ["precision machining", "additive manufacturing", "precision manufacturing"],
-}
-AREAS = list(AREA_KEYWORDS)
-AWARD_DAYS = 30
-
-
-def pretty(text, limit=150):
-    t = re.sub(r"\s+", " ", text or "").strip()
-    if t and t.upper() == t:
-        t = t.lower().capitalize()
-    return t[:limit] + ("…" if len(t) > limit else "")
-
-
-def nice_company(name):
-    n = re.sub(r"\s+", " ", name or "").strip()
-    return n.title() if n.upper() == n else n
-
-
-def fetch_awards_area(area):
-    end = datetime.now(timezone.utc).date()
-    body = {"filters": {
-                "time_period": [{"start_date": str(end - timedelta(days=AWARD_DAYS)), "end_date": str(end),
-                                 "date_type": "action_date"}],
-                "award_type_codes": ["A", "B", "C", "D"],
-                "agencies": [{"type": "awarding", "tier": "toptier", "name": "Department of Defense"}],
-                "keywords": AREA_KEYWORDS[area]},
-            "fields": ["Award ID", "Recipient Name", "Award Amount", "Description",
-                       "Awarding Sub Agency", "Start Date", "generated_internal_id"],
-            "sort": "Award Amount", "order": "desc", "limit": 25, "page": 1}
-    req = Request("https://api.usaspending.gov/api/v2/search/spending_by_award/",
-                  data=json.dumps(body).encode(), method="POST",
-                  headers={"User-Agent": UA, "Content-Type": "application/json"})
-    with urlopen(req, timeout=40) as r:
-        data = json.loads(r.read().decode("utf-8", "replace"))
-    out = []
-    for a in data.get("results") or []:
-        amt = a.get("Award Amount")
-        if not isinstance(amt, (int, float)) or amt <= 0 or not a.get("generated_internal_id"):
-            continue
-        out.append({"id": str(a.get("Award ID") or ""), "date": str(a.get("Start Date") or "")[:10],
-                    "who": nice_company(a.get("Recipient Name")), "what": pretty(a.get("Description")),
-                    "agency": nice_company(a.get("Awarding Sub Agency")), "value": amt, "area": area,
-                    "url": "https://www.usaspending.gov/award/" + str(a["generated_internal_id"])})
-    return out
-
-
-def run_awards():
-    """Refresh the contract list (best effort). Keeps the old list if the source is down."""
-    if aw_state["running"]:
-        return False
-    aw_state["running"] = True
-    try:
-        ensure_loaded()
-        got, errs = [], 0
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            for res, step in pool.map(lambda a: attempt("USAspending", fetch_awards_area, a), AREAS):
-                if step["status"] == "ok":
-                    got += res
-                else:
-                    errs += 1
-                    aw_state["error"] = "Some contract searches failed: " + step["status"]
-        seen, uniq = set(), []
-        for a in sorted(got, key=lambda x: -x["value"]):
-            if a["url"] not in seen:
-                seen.add(a["url"])
-                uniq.append(a)
-        if uniq:
-            with store_lock:
-                store["awards"] = sorted(uniq, key=lambda x: x["date"], reverse=True)
-                store["awards_at"] = time.time()
-            store_save(slot_of(local_now()))
-            aw_state["error"] = None if not errs else aw_state["error"]
-        elif not errs:
-            aw_state["error"] = "No contracts found."
-        return bool(uniq)
-    except Exception as ex:
-        aw_state["error"] = "Contract update failed: " + str(ex)[:80]
-        return False
-    finally:
-        aw_state["last_try"] = time.time()
-        aw_state["running"] = False
-
-
-def kick_awards():
-    ensure_loaded()
-    stale = time.time() - store["awards_at"] > 20 * 3600
-    if stale and not aw_state["running"] and time.time() - aw_state["last_try"] > RETRY_GAP:
-        threading.Thread(target=run_awards, daemon=True).start()
-        return True
-    return aw_state["running"]
-
-
-_CO_NOISE = re.compile(r"\b(inc|llc|ltd|corp|corporation|company|co|the|lp|llp|plc|group|holdings|usa|us)\b", re.I)
-
-
-def company_key(name):
-    w = re.sub(r"[^a-z0-9 ]", " ", _CO_NOISE.sub(" ", name.lower())).split()
-    return " ".join(w[:2])
-
-
-def supplier_summary():
-    """Top recipients per area from the awards, with how often they appear in the saved news."""
-    ensure_loaded()
-    titles = " | ".join(re.sub(r"[^a-z0-9 ]", " ", i["title"].lower())
-                        for d in store["days"].values() for i in d.get("items", []))
-    areas = {}
-    for a in store["awards"]:
-        e = areas.setdefault(a["area"], {}).setdefault(a["who"], {"name": a["who"], "value": 0.0, "awards": 0, "latest": a})
-        e["value"] += a["value"]
-        e["awards"] += 1
-        if a["date"] > e["latest"]["date"]:
-            e["latest"] = a
-    out = {}
-    for area, cos in areas.items():
-        rows = []
-        for c in cos.values():
-            k = company_key(c["name"])
-            mentions = titles.count(k) if len(k) > 3 else 0
-            rows.append({"name": c["name"], "value": c["value"], "awards": c["awards"], "mentions": mentions,
-                         "latest": c["latest"]["what"], "latest_date": c["latest"]["date"],
-                         "latest_url": c["latest"]["url"]})
-        rows.sort(key=lambda r: -r["value"])
-        out[area] = rows[:5]
-    return out
-
-
-@app.route("/api/contracts")
-def contracts_api():
-    updating = kick_awards()
-    return jsonify({"areas": AREAS, "awards": store["awards"][:200], "suppliers": supplier_summary(),
-                    "updated_label": nice(datetime.fromtimestamp(store["awards_at"], tz())) if store["awards_at"] else None,
-                    "updating": updating, "error": aw_state["error"], "window_days": AWARD_DAYS})
 
 
 @app.route("/api/news")
@@ -3159,7 +3014,7 @@ function load() {
       render();
       if (j.updating && poll++ < 30) setTimeout(load, 8000);
     })
-    .catch(function () { $('#st').textContent = 'Could not load news.'; });
+    .catch(function () { $('#st').textContent = 'Could not reach the server. The free host may be waking up; reload in a minute.'; });
 }
 
 /* ---- Trend watch ---- */
@@ -3304,389 +3159,1354 @@ loadTrends();
 </body></html>"""
 
 
-CONTRACTS_PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Contracts &amp; Suppliers</title>
+# =============================================================================
+# Battle Lab: a world map of publicly reported weapon systems, by category.
+# Names, status, range and speed are headline figures from public reporting only
+# (marked reported / claimed / estimated); each system links to Wikipedia.
+# It is a visual reference: rings show distance from a launcher, nothing more.
+# To update: edit the systems below (ask Claude to check current public sources).
+# =============================================================================
+# Countries: code -> (name, ISO numeric id used by the map, [lon, lat] of the map counter)
+_COUNTRY = {
+    "RUS": ("Russia", "643", [92, 62]), "CHN": ("China", "156", [103, 34]),
+    "USA": ("United States", "840", [-99, 39]), "PRK": ("North Korea", "408", [126.5, 40.5]),
+    "KOR": ("South Korea", "410", [128, 36.3]), "IND": ("India", "356", [78, 22]),
+    "PAK": ("Pakistan", "586", [69.5, 30]), "IRN": ("Iran", "364", [54, 32]),
+    "ISR": ("Israel", "376", [35, 31]), "TUR": ("Turkey", "792", [35, 39]),
+    "UKR": ("Ukraine", "804", [31.5, 49]), "FRA": ("France", "250", [2.5, 46.5]),
+    "GBR": ("United Kingdom", "826", [-2, 53.5]), "DEU": ("Germany", "276", [10.4, 51]),
+    "NOR": ("Norway", "578", [9, 61.5]), "JPN": ("Japan", "392", [140, 37]),
+    "TWN": ("Taiwan", "158", [121, 23.7]),
+}
+
+
+def _sys(name, kind, status, wiki, desc, rng, speed, ring=None, ring_note=""):
+    """ring: radius in km for the map ring (None = no published range, no ring); ring_note says which figure."""
+    return {"name": name, "kind": kind, "status": status, "wiki": wiki, "desc": desc, "range": rng,
+            "speed": speed, "ring_km": ring, "ring_note": ring_note}
+
+
+def _cty(code, *systems):
+    name, iso, at = _COUNTRY[code]
+    return {"name": name, "code": code, "iso": iso, "at": at, "systems": list(systems)}
+
+
+# Each category: group ("Strike" draws red rings, "Defence" blue), a short label for the
+# header button, a one-line description for the picker, and its countries and systems.
+BATTLE_LAB = {
+    "Hypersonic": {
+        "group": "Strike", "short": "Hypersonic",
+        "blurb": "Weapons that fly faster than Mach 5 for much of their flight: glide vehicles and scramjet cruise missiles.",
+        "countries": [
+            _cty("RUS",
+                 _sys("Avangard", "Glide vehicle", "In service", "Avangard (hypersonic glide vehicle)",
+                      "Glide vehicle carried on an intercontinental ballistic missile. Russia declared it operational in 2019.",
+                      "Intercontinental (launched on an ICBM)", "Up to Mach 20+ (claimed)",
+                      5500, "Minimum for an intercontinental weapon; the real reach is longer"),
+                 _sys("Kinzhal", "Air-launched ballistic", "In service", "Kh-47M2 Kinzhal",
+                      "Air-launched ballistic missile carried by MiG-31K aircraft, in Russian service since 2017.",
+                      "About 480 km; up to 2,000 km including the aircraft's flight (claimed)", "Up to Mach 10 (claimed)",
+                      2000, "Claimed reach including the carrier aircraft's flight"),
+                 _sys("Zircon", "Cruise (scramjet)", "In service", "3M22 Zircon",
+                      "Scramjet-powered cruise missile for ships and submarines, declared in service in 2023.",
+                      "About 400 to 1,000 km (reported)", "Mach 8 to 9 (claimed)", 1000, "Upper reported figure")),
+            _cty("CHN",
+                 _sys("DF-17", "Ballistic + glide vehicle", "In service", "DF-17",
+                      "Medium-range ballistic missile carrying a hypersonic glide vehicle, first shown publicly in 2019.",
+                      "About 1,800 to 2,500 km (reported)", "Mach 5 to 10 (reported)", 2500, "Upper reported figure"),
+                 _sys("DF-27", "Ballistic + glide vehicle", "Reported in service", "DF-27",
+                      "Longer-range ballistic missile with a glide vehicle, described in US Department of Defense reports.",
+                      "About 5,000 to 8,000 km (US DoD estimate)", "Not published", 8000, "Upper US DoD estimate"),
+                 _sys("YJ-21", "Anti-ship", "Reported in service", "YJ-21",
+                      "Anti-ship ballistic missile launched from Type 055 destroyers, first shown publicly in 2022.",
+                      "About 1,000 to 1,500 km (reported)", "Up to Mach 10 in the final phase (reported)", 1500, "Upper reported figure")),
+            _cty("USA",
+                 _sys("Dark Eagle", "Ground-launched glide", "Fielding", "Long-Range Hypersonic Weapon",
+                      "The US Army's Long-Range Hypersonic Weapon, a ground-launched glide body. The first battery is being fielded.",
+                      "About 2,775 km (reported)", "Over Mach 5 (reported)", 2775, "Reported figure"),
+                 _sys("Conventional Prompt Strike", "Sea-launched glide", "Tested", "Conventional Prompt Strike",
+                      "The US Navy's version of the common hypersonic glide body, for destroyers and submarines.",
+                      "Not published; uses the same glide body as Dark Eagle", "Over Mach 5 (reported)"),
+                 _sys("ARRW", "Air-launched glide", "Tested", "AGM-183 ARRW",
+                      "Air-launched glide weapon flight-tested from B-52 aircraft by the US Air Force.",
+                      "About 1,600 km (reported)", "Mach 6.5 to 8 on average (reported)", 1600, "Reported figure"),
+                 _sys("HACM", "Cruise (scramjet)", "In development", "Hypersonic Attack Cruise Missile",
+                      "Air-breathing scramjet cruise missile in development for the US Air Force.",
+                      "Not published", "Over Mach 5 (planned)")),
+            _cty("PRK",
+                 _sys("Hwasong-8", "Ballistic + glide vehicle", "Tested", "Hwasong-8",
+                      "Ballistic missile with a glide vehicle, first tested by North Korea in 2021.",
+                      "Not published", "Hypersonic (claimed)"),
+                 _sys("Hwasong-16B", "Ballistic + glide vehicle", "Tested", "Hwasong-16B",
+                      "Solid-fuel intermediate-range missile with a glide vehicle, tested in 2024.",
+                      "Intermediate range, over 3,000 km (estimated)", "Hypersonic (claimed)",
+                      3000, "Lower estimate (reported as over 3,000 km)")),
+            _cty("IND",
+                 _sys("LRAShM", "Anti-ship glide", "Tested", "Long Range Anti-Ship Missile (India)",
+                      "Indian anti-ship glide missile. Its first long-range flight test was announced in November 2024.",
+                      "About 1,500 km (stated by DRDO)", "Up to Mach 10 (reported)", 1500, "Figure stated by DRDO"),
+                 _sys("HSTDV", "Scramjet demonstrator", "Tested", "Hypersonic Technology Demonstrator Vehicle",
+                      "Indian scramjet technology demonstrator, flown in a scramjet test in 2020.",
+                      "Not applicable (demonstrator)", "About Mach 6 in the 2020 test (reported)"),
+                 _sys("BrahMos-II", "Cruise (scramjet)", "In development", "BrahMos-II",
+                      "Planned hypersonic successor to the BrahMos cruise missile, developed by India and Russia.",
+                      "About 1,500 km (planned, reported)", "Mach 7 to 8 (planned)", 1500, "Planned figure, reported")),
+            _cty("IRN",
+                 _sys("Fattah-1", "Ballistic, manoeuvring", "Claimed", "Fattah (missile)",
+                      "Missile unveiled in 2023 that Iran describes as hypersonic. Independent analysts dispute the claim.",
+                      "About 1,400 km (claimed)", "Mach 13 to 15 (claimed)", 1400, "Claimed figure")),
+            _cty("FRA",
+                 _sys("V-MaX", "Glide demonstrator", "Tested", "V-MaX",
+                      "French hypersonic glide vehicle demonstrator, first flight-tested in 2023.",
+                      "Not published", "Over Mach 5 (reported)")),
+            _cty("JPN",
+                 _sys("HVGP", "Ground-launched glide", "In development", "Hyper Velocity Gliding Projectile",
+                      "Japanese ground-launched glide projectile for the defence of remote islands.",
+                      "Several hundred km for the first version (reported)", "Over Mach 5 (reported)")),
+        ]},
+
+    "Ballistic missiles": {
+        "group": "Strike", "short": "Ballistic",
+        "blurb": "Ground-launched rockets that fly a high arcing path, from short range up to intermediate range.",
+        "countries": [
+            _cty("RUS",
+                 _sys("Iskander-M", "Short-range ballistic", "In service", "9K720 Iskander",
+                      "Road-mobile short-range ballistic missile system, in Russian service since 2006.",
+                      "About 500 km (official figure)", "Up to about Mach 6 (reported)", 500, "Official figure")),
+            _cty("CHN",
+                 _sys("DF-21", "Medium-range ballistic", "In service", "DF-21",
+                      "Road-mobile medium-range ballistic missile; the DF-21D variant is described as an anti-ship weapon.",
+                      "About 1,500 to 1,750 km (reported)", "Up to Mach 10 (reported)", 1750, "Upper reported figure"),
+                 _sys("DF-26", "Intermediate-range ballistic", "In service", "DF-26",
+                      "Road-mobile intermediate-range ballistic missile, first shown publicly in 2015.",
+                      "About 4,000 km (reported)", "Not published", 4000, "Reported figure")),
+            _cty("USA",
+                 _sys("PrSM", "Short-range ballistic", "In service", "Precision Strike Missile",
+                      "The US Army's Precision Strike Missile, replacing ATACMS; first missiles delivered in 2023.",
+                      "Over 500 km (Increment 1, reported)", "Not published", 500, "Lower figure (reported as over 500 km)"),
+                 _sys("ATACMS", "Short-range ballistic", "In service", "MGM-140 ATACMS",
+                      "Army Tactical Missile System, fired from HIMARS and M270 launchers since the 1990s.",
+                      "About 300 km (reported)", "About Mach 3 (reported)", 300, "Reported figure")),
+            _cty("PRK",
+                 _sys("Hwasong-11", "Short-range ballistic", "Reported in service", "Hwasong-11",
+                      "Solid-fuel short-range ballistic missile family (also known as KN-23), first tested in 2019.",
+                      "About 450 to 690 km (reported)", "Not published", 690, "Upper reported figure")),
+            _cty("KOR",
+                 _sys("Hyunmoo-2", "Short-range ballistic", "In service", "Hyunmoo-2",
+                      "South Korean short-range ballistic missile family, with variants of increasing range.",
+                      "About 300 to 800 km depending on variant (reported)", "Not published", 800, "Longest-range variant, reported")),
+            _cty("IND",
+                 _sys("Prithvi-II", "Short-range ballistic", "In service", "Prithvi (missile)",
+                      "Indian short-range ballistic missile, in service since the early 2000s.",
+                      "About 350 km (reported)", "Not published", 350, "Reported figure"),
+                 _sys("Agni-P", "Medium-range ballistic", "Tested", "Agni-P",
+                      "Canister-launched medium-range ballistic missile, first tested in 2021.",
+                      "About 1,000 to 2,000 km (reported)", "Not published", 2000, "Upper reported figure")),
+            _cty("PAK",
+                 _sys("Shaheen-III", "Medium-range ballistic", "Reported in service", "Shaheen-III",
+                      "Pakistani solid-fuel medium-range ballistic missile, first tested in 2015.",
+                      "About 2,750 km (claimed)", "Not published", 2750, "Claimed figure")),
+            _cty("IRN",
+                 _sys("Fateh-110", "Short-range ballistic", "In service", "Fateh-110",
+                      "Iranian solid-fuel short-range ballistic missile family.",
+                      "About 300 km (reported)", "Over Mach 3 (reported)", 300, "Reported figure"),
+                 _sys("Kheibar Shekan", "Medium-range ballistic", "In service", "Kheibar Shekan",
+                      "Iranian solid-fuel medium-range ballistic missile, unveiled in 2022.",
+                      "About 1,450 km (claimed)", "Not published", 1450, "Claimed figure")),
+        ]},
+
+    "Cruise missiles": {
+        "group": "Strike", "short": "Cruise",
+        "blurb": "Missiles that fly low and level like a small aircraft, mostly below the speed of sound, to strike land targets.",
+        "countries": [
+            _cty("USA",
+                 _sys("Tomahawk", "Land-attack cruise", "In service", "Tomahawk (missile)",
+                      "Long-range land-attack cruise missile in service since the 1980s; now also fired from the Army's Typhon ground launcher.",
+                      "About 1,600 km (reported)", "About Mach 0.75 (subsonic, reported)", 1600, "Reported figure")),
+            _cty("RUS",
+                 _sys("Kalibr", "Land-attack cruise", "In service", "3M-54 Kalibr",
+                      "Russian cruise missile family fired from ships and submarines; the land-attack version is the 3M-14.",
+                      "About 1,500 to 2,500 km (reported)", "Subsonic (reported)", 2500, "Upper reported figure"),
+                 _sys("Iskander-K", "Ground-launched cruise", "In service", "9K720 Iskander",
+                      "Cruise missile version of the Iskander system, fired from the same road-mobile launchers.",
+                      "About 500 km (official figure)", "Subsonic (reported)", 500, "Official figure")),
+            _cty("CHN",
+                 _sys("CJ-10", "Ground-launched cruise", "In service", "CJ-10 (missile)",
+                      "Chinese ground-launched land-attack cruise missile, first shown publicly in 2009.",
+                      "About 1,500 to 2,000 km (reported)", "Subsonic (reported)", 2000, "Upper reported figure")),
+            _cty("GBR",
+                 _sys("Storm Shadow", "Air-launched cruise", "In service", "Storm Shadow",
+                      "Anglo-French air-launched cruise missile (SCALP in France), in service since 2003.",
+                      "Over 250 km (export); about 550 km (reported)", "About Mach 0.8 (subsonic, reported)", 550, "Upper reported figure")),
+            _cty("IND",
+                 _sys("LRLACM", "Ground-launched cruise", "Tested", "Long Range Land Attack Cruise Missile",
+                      "Indian long-range land-attack cruise missile developed from the Nirbhay programme, flight-tested from 2023.",
+                      "About 1,000 km or more (reported)", "Subsonic (reported)", 1000, "Lower reported figure")),
+            _cty("KOR",
+                 _sys("Hyunmoo-3", "Ground-launched cruise", "In service", "Hyunmoo-3",
+                      "South Korean land-attack cruise missile family with versions of increasing range.",
+                      "About 500 to 1,500 km depending on version (reported)", "Subsonic (reported)", 1500, "Longest-range version, reported")),
+            _cty("TWN",
+                 _sys("Hsiung Feng IIE", "Ground-launched cruise", "In service", "Hsiung Feng IIE",
+                      "Taiwanese land-attack cruise missile, fired from road-mobile launchers.",
+                      "About 600 to 1,200 km (reported)", "Subsonic (reported)", 1200, "Upper reported figure")),
+            _cty("IRN",
+                 _sys("Hoveyzeh", "Ground-launched cruise", "In service", "Hoveyzeh (cruise missile)",
+                      "Iranian ground-launched land-attack cruise missile, unveiled in 2019.",
+                      "About 1,350 km (claimed)", "Subsonic (claimed)", 1350, "Claimed figure")),
+        ]},
+
+    "Anti-ship missiles": {
+        "group": "Strike", "short": "Anti-ship",
+        "blurb": "Missiles built to hit ships at sea. Shown here with their coastal (land-based) launchers where they exist.",
+        "countries": [
+            _cty("NOR",
+                 _sys("NSM", "Coastal / ship anti-ship", "In service", "Naval Strike Missile",
+                      "Norwegian Naval Strike Missile, used on ships and in coastal batteries, including the US Marine Corps' NMESIS.",
+                      "Over 185 km (reported)", "High subsonic (reported)", 185, "Lower figure (reported as over 185 km)")),
+            _cty("IND",
+                 _sys("BrahMos", "Coastal / ship anti-ship", "In service", "BrahMos",
+                      "Indian-Russian supersonic cruise missile, fired from ships, aircraft and coastal launchers.",
+                      "About 290 km; extended versions about 450 km (reported)", "Mach 2.8 to 3 (reported)", 450, "Extended-range version, reported")),
+            _cty("RUS",
+                 _sys("Bastion (P-800 Oniks)", "Coastal anti-ship", "In service", "P-800 Oniks",
+                      "Coastal defence system firing the supersonic P-800 Oniks missile.",
+                      "About 300 to 600 km (reported)", "About Mach 2.5 (reported)", 600, "Upper reported figure")),
+            _cty("CHN",
+                 _sys("YJ-12", "Ship / air / coastal anti-ship", "In service", "YJ-12",
+                      "Chinese supersonic anti-ship missile, with ship, aircraft and coastal versions.",
+                      "About 400 km (reported)", "Up to Mach 3 (reported)", 400, "Reported figure")),
+            _cty("USA",
+                 _sys("Harpoon", "Ship / coastal anti-ship", "In service", "Harpoon (missile)",
+                      "Long-serving US anti-ship missile, used on ships, aircraft and in coastal batteries.",
+                      "About 125 km; extended-range version about 250 km (reported)", "High subsonic (reported)", 250, "Extended-range version")),
+            _cty("JPN",
+                 _sys("Type 12", "Coastal anti-ship", "In service", "Type 12 surface-to-ship missile",
+                      "Japanese truck-mounted coastal anti-ship missile; a much longer-range improved version is in development.",
+                      "About 200 km; improved version over 1,000 km (planned, reported)", "Subsonic (reported)", 200, "In-service version")),
+            _cty("TWN",
+                 _sys("Hsiung Feng III", "Ship / coastal anti-ship", "In service", "Hsiung Feng III",
+                      "Taiwanese supersonic anti-ship missile, on ships and coastal launchers.",
+                      "About 150 to 400 km (reported)", "Up to Mach 3 (reported)", 400, "Upper reported figure")),
+            _cty("UKR",
+                 _sys("Neptune", "Coastal anti-ship", "In service", "R-360 Neptune",
+                      "Ukrainian truck-mounted coastal anti-ship missile, in service since 2021.",
+                      "About 280 km (reported)", "Subsonic (reported)", 280, "Original version, reported")),
+            _cty("IRN",
+                 _sys("Noor", "Coastal / ship anti-ship", "In service", "Noor (missile)",
+                      "Iranian anti-ship missile derived from the Chinese C-802.",
+                      "About 120 to 170 km (reported)", "Subsonic (reported)", 170, "Upper reported figure")),
+        ]},
+
+    "Long-range air & missile defence": {
+        "group": "Defence", "short": "Long-range AD",
+        "blurb": "Surface-to-air systems that defend large areas against aircraft, cruise missiles and some ballistic missiles.",
+        "countries": [
+            _cty("USA",
+                 _sys("Patriot", "Long-range surface-to-air", "In service", "MIM-104 Patriot",
+                      "US surface-to-air missile system, in service since the 1980s and used by many countries.",
+                      "Up to about 160 km against aircraft; shorter against ballistic missiles (reported)", "Over Mach 4 (reported)",
+                      160, "Upper figure, against aircraft")),
+            _cty("RUS",
+                 _sys("S-400", "Long-range surface-to-air", "In service", "S-400 missile system",
+                      "Russian long-range surface-to-air system, in service since 2007, using several missile types.",
+                      "Up to about 400 km with its longest-range missile (claimed)", "About Mach 6 (48N6, reported)",
+                      400, "Claimed maximum with the longest-range missile"),
+                 _sys("S-500", "Long-range air & missile defence", "Reported in service", "S-500 missile system",
+                      "Russian successor to the S-400, intended also against ballistic missiles; first units reported in 2021.",
+                      "About 600 km (claimed)", "Not published", 600, "Claimed figure")),
+            _cty("CHN",
+                 _sys("HQ-9", "Long-range surface-to-air", "In service", "HQ-9",
+                      "Chinese long-range surface-to-air missile system, on land and on ships.",
+                      "About 200 to 250 km (reported)", "About Mach 4 (reported)", 250, "Upper reported figure")),
+            _cty("FRA",
+                 _sys("SAMP/T", "Long-range surface-to-air", "In service", "SAMP/T",
+                      "French-Italian surface-to-air system using the Aster 30 missile.",
+                      "About 120 km; about 150 km for SAMP/T NG (reported)", "About Mach 4.5 (reported)", 120, "In-service version")),
+            _cty("ISR",
+                 _sys("David's Sling", "Medium/long-range air & missile defence", "In service", "David's Sling",
+                      "Israeli system for the middle layer of its air defence, between Iron Dome and Arrow.",
+                      "About 40 to 300 km (reported)", "Not published", 300, "Upper reported figure")),
+            _cty("IRN",
+                 _sys("Bavar-373", "Long-range surface-to-air", "In service", "Bavar-373",
+                      "Iranian long-range surface-to-air system, unveiled in 2019.",
+                      "About 200 to 300 km (claimed)", "Not published", 300, "Upper claimed figure")),
+        ]},
+
+    "Ballistic missile defence": {
+        "group": "Defence", "short": "Missile defence",
+        "blurb": "Interceptors built to stop ballistic missiles, high in the atmosphere or in space.",
+        "countries": [
+            _cty("USA",
+                 _sys("THAAD", "High-altitude missile defence", "In service", "Terminal High Altitude Area Defense",
+                      "US system that intercepts ballistic missiles near the top of the atmosphere, in service since 2008.",
+                      "About 200 km (reported)", "Over Mach 8 (reported)", 200, "Reported figure"),
+                 _sys("SM-3 (Aegis Ashore)", "Missile defence in space", "In service", "RIM-161 Standard Missile 3",
+                      "Interceptor that hits ballistic missiles in space; fired from ships and from Aegis Ashore land sites.",
+                      "Up to about 1,200 km (Block IIA, reported)", "Not published", 1200, "Block IIA, reported"),
+                 _sys("GMD", "Homeland missile defence", "In service", "Ground-Based Midcourse Defense",
+                      "Interceptors in Alaska and California designed to stop long-range missiles in space.",
+                      "Not published", "Not published")),
+            _cty("ISR",
+                 _sys("Arrow 3", "Missile defence in space", "In service", "Arrow 3",
+                      "Israeli-US interceptor that stops ballistic missiles above the atmosphere, in service since 2017.",
+                      "About 2,400 km (reported)", "Not published", 2400, "Reported figure"),
+                 _sys("Arrow 2", "High-altitude missile defence", "In service", "Arrow (missile family)",
+                      "Earlier Arrow interceptor that stops ballistic missiles in the upper atmosphere.",
+                      "About 90 to 150 km (reported)", "About Mach 9 (reported)", 150, "Upper reported figure")),
+            _cty("CHN",
+                 _sys("HQ-19", "Missile defence in space", "Reported in service", "HQ-19",
+                      "Chinese interceptor reported to target ballistic missiles in the midcourse phase.",
+                      "Not published", "Not published")),
+            _cty("RUS",
+                 _sys("A-235", "Homeland missile defence", "Reported in service", "A-235 anti-ballistic missile system",
+                      "Missile defence system around Moscow, replacing the older A-135.",
+                      "Not published", "Not published")),
+            _cty("IND",
+                 _sys("PDV / AD-1", "Ballistic missile defence", "Tested", "Indian Ballistic Missile Defence Programme",
+                      "Interceptors of India's two-tier ballistic missile defence programme.",
+                      "Not published", "Not published")),
+        ]},
+
+    "Short/medium-range air defence": {
+        "group": "Defence", "short": "Short-range AD",
+        "blurb": "Systems that protect cities, bases and troops against rockets, drones, cruise missiles and aircraft at closer range.",
+        "countries": [
+            _cty("ISR",
+                 _sys("Iron Dome", "Short-range air defence", "In service", "Iron Dome",
+                      "Israeli system against rockets, artillery and drones, in service since 2011.",
+                      "About 4 to 70 km (reported)", "About Mach 2 (reported)", 70, "Upper reported figure")),
+            _cty("NOR",
+                 _sys("NASAMS", "Medium-range surface-to-air", "In service", "NASAMS",
+                      "Norwegian-US system that fires AMRAAM missiles from ground launchers; protects Washington, D.C.",
+                      "About 30 to 50 km depending on missile (reported)", "Not published", 50, "Upper figure, AMRAAM-ER")),
+            _cty("DEU",
+                 _sys("IRIS-T SLM", "Medium-range surface-to-air", "In service", "IRIS-T SLM",
+                      "German medium-range system, widely used in Ukraine since 2022.",
+                      "About 40 km (reported)", "About Mach 3 (reported)", 40, "Reported figure")),
+            _cty("RUS",
+                 _sys("Pantsir", "Short-range air defence", "In service", "Pantsir missile system",
+                      "Russian truck-mounted gun and missile system for close-in air defence.",
+                      "About 20 km; about 30 km for Pantsir-SM (reported)", "Not published", 20, "In-service missiles, reported"),
+                 _sys("Buk-M3", "Medium-range surface-to-air", "In service", "Buk missile system",
+                      "Latest version of the Russian Buk medium-range surface-to-air system.",
+                      "Up to about 70 km (reported)", "Not published", 70, "Reported figure")),
+            _cty("CHN",
+                 _sys("HQ-16", "Medium-range surface-to-air", "In service", "HQ-16",
+                      "Chinese medium-range surface-to-air system, on land and on ships.",
+                      "About 40 km; about 70 km for HQ-16B (reported)", "Not published", 40, "Original version, reported")),
+            _cty("GBR",
+                 _sys("Sky Sabre", "Short/medium-range air defence", "In service", "Sky Sabre",
+                      "British Army system using the CAMM missile, in service since 2021.",
+                      "Over 25 km (reported)", "Not published", 25, "Lower figure (reported as over 25 km)")),
+            _cty("TUR",
+                 _sys("Hisar-O", "Medium-range surface-to-air", "In service", "Hisar (missile)",
+                      "Turkish medium-range surface-to-air system.",
+                      "About 25 km (reported)", "Not published", 25, "Reported figure")),
+            _cty("IND",
+                 _sys("Akash", "Short/medium-range surface-to-air", "In service", "Akash (missile)",
+                      "Indian surface-to-air system; the newer Akash-NG has longer range.",
+                      "About 25 to 30 km; about 70 km for Akash-NG (reported)", "About Mach 2.5 (reported)", 30, "In-service version")),
+        ]},
+}
+for _cat in BATTLE_LAB.values():
+    for _c in _cat["countries"]:
+        for _s in _c["systems"]:
+            _s["role"] = "defensive" if _cat["group"] == "Defence" else "offensive"
+
+BATTLE_PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Battle Lab</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Jost:wght@500;700&family=Zilla+Slab:ital,wght@0,400;0,600;1,400&display=swap">
 <style>
-/* Layout: one column in the pastel-blue dashboard style; two tabs (Contract Awards, Supplier Map) under one header, with a topic filter. */
+/* Layout: the map fills the whole window; the bar (home link, weapon picker, title) floats over its top edge.
+   Desktop: the roster is a dark panel down the left. Phone: it becomes a bottom sheet.
+   Look: a dark command-map style (this page only); the rest of the site keeps the pastel theme. */
 :root{
-  color-scheme:light;
-  --bg:#dcebfa; --ink:#26324f; --muted:#52638a; --panel:#fcfcfb;
-  --aqua:#bfe8e3; --butter:#f7e7b0; --blue:#6f8be0; --link:#2f4fa2; --rise:#2f4fa2;
-  --ink-rgb:38 50 79; --blue-rgb:111 139 224;
-  --x3:color-mix(in srgb,var(--blue) 64%,var(--ink)); --x4:color-mix(in srgb,var(--blue) 56%,var(--ink));
-  --x5:color-mix(in srgb,var(--blue) 48%,var(--ink)); --x6:color-mix(in srgb,var(--blue) 40%,var(--ink));
-  --display:"Jost","Futura","Century Gothic",system-ui,sans-serif;
-  --body:"Zilla Slab","Archer","Rockwell",Georgia,serif;
-}
-*{box-sizing:border-box}
-body{margin:0;padding-inline:16px;padding-block:24px 56px;background:radial-gradient(60% 45% at 12% 4%,rgb(150 160 240 / .45),transparent 70%),radial-gradient(55% 40% at 94% 98%,rgb(176 230 226 / .8),transparent 70%),var(--bg);background-attachment:fixed;color:var(--ink);font-family:var(--body);font-size:16px;line-height:1.45}
-.page{max-width:62rem;margin:0 auto;min-width:0}
-.back{display:inline-block;color:var(--link);font-family:var(--display);font-weight:500;font-size:.95rem;letter-spacing:.06em;text-decoration:none;margin-bottom:6px}
-h1{margin:0;font-family:var(--display);font-weight:700;font-size:clamp(1.6rem,7vw,3rem);letter-spacing:.1em;text-transform:uppercase;line-height:1.1;text-shadow:3px 3px 0 var(--blue);text-wrap:balance}
-.sample{margin:14px 0 0;padding:9px 12px;border-radius:12px;border:1.5px dashed rgb(var(--ink-rgb) / .5);background:rgb(255 255 255 / .55);font-size:.95rem}
-.sample b{font-family:var(--display);letter-spacing:.1em;text-transform:uppercase;font-size:.78rem;margin-right:6px}
-.tabs{display:flex;gap:10px;margin:18px 0 0;flex-wrap:wrap}
-.tab{cursor:pointer;padding:9px 18px;border-radius:999px;border:2px solid var(--ink);background:#f5faff;color:var(--ink);font-family:var(--display);font-weight:700;font-size:.8rem;letter-spacing:.14em;text-transform:uppercase;box-shadow:0 1px 0 var(--x3),0 2px 0 var(--x4),0 3px 0 var(--x5)}
-.tab[aria-selected="true"]{background:var(--aqua);transform:translateY(2px);box-shadow:0 1px 0 var(--x3)}
-.tab:focus-visible,.chip:focus-visible,.co:focus-visible{outline:3px solid var(--link);outline-offset:3px}
-.chips{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0 0}
-.chip{cursor:pointer;padding:5px 13px;border-radius:999px;border:2px solid rgb(var(--ink-rgb) / .45);background:rgb(255 255 255 / .55);color:var(--ink);font-family:var(--display);font-weight:500;font-size:.85rem;letter-spacing:.04em}
-.chip[aria-pressed="true"]{background:var(--aqua);border-color:var(--ink);font-weight:700}
-.panel{margin:16px 0 0;padding:16px clamp(14px,3vw,22px) 18px;border-radius:22px;border:2px solid var(--ink);background:var(--panel);box-shadow:0 1px 0 var(--x3),0 2px 0 var(--x4),0 3px 0 var(--x5),0 4px 0 var(--x6),0 16px 22px -12px rgb(var(--ink-rgb) / .35)}
-.panel h2{margin:0 0 4px;font-family:var(--display);font-weight:700;font-size:.82rem;letter-spacing:.14em;text-transform:uppercase}
-.panel .sub{margin:0 0 12px;color:var(--muted);font-size:.93rem}
-.bars{display:grid;gap:7px;max-width:44rem}
-.brow{display:grid;grid-template-columns:minmax(5.6rem,8rem) 1fr 4.8rem;gap:10px;align-items:center}
-.brow .lab{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.brow .val{font-family:var(--display);font-weight:700;font-size:.85rem;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
-.track{position:relative;height:14px}
-.track::before{content:"";position:absolute;left:0;top:-3px;bottom:-3px;width:1.5px;background:rgb(var(--ink-rgb) / .35)}
-.fill{position:absolute;left:0;top:0;height:100%;border-radius:0 4px 4px 0;background:var(--rise)}
-.list{list-style:none;margin:0;padding:0}
-.row{display:grid;grid-template-columns:5.6rem 1fr auto;gap:4px 14px;padding:12px 0;border-top:1px solid rgb(var(--ink-rgb) / .15);align-items:start}
-.row:first-child{border-top:0}
-.row .d{font-family:var(--display);font-weight:500;font-size:.82rem;letter-spacing:.06em;color:var(--muted);padding-top:2px}
-.row .t{font-weight:600;font-size:1.02rem;min-width:0}
-.row .s{display:block;font-weight:400;color:var(--muted);font-size:.92rem;margin-top:2px}
-.row .v{font-family:var(--display);font-weight:700;font-size:1.05rem;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
-.tag{display:inline-block;margin-top:6px;padding:2px 9px;border-radius:999px;background:var(--butter);border:1.5px solid rgb(var(--ink-rgb) / .35);font-family:var(--display);font-weight:700;font-size:.64rem;letter-spacing:.12em;text-transform:uppercase}
-@media (max-width:560px){.row{grid-template-columns:1fr auto}.row .d{grid-column:1 / -1;padding:0}}
-.lanes{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,17rem),1fr));gap:14px;margin-top:16px}
-.lane{padding:12px 14px 14px;border-radius:18px;border:2px solid var(--ink);background:var(--panel);box-shadow:0 1px 0 var(--x3),0 2px 0 var(--x4),0 3px 0 var(--x5)}
-.lane h3{margin:0 0 10px;font-family:var(--display);font-weight:700;font-size:.82rem;letter-spacing:.14em;text-transform:uppercase}
-.cos{display:grid;gap:8px}
-.co{cursor:pointer;display:grid;grid-template-columns:1fr auto;gap:2px 10px;text-align:left;width:100%;padding:8px 10px;border-radius:12px;border:1.5px solid rgb(var(--ink-rgb) / .3);background:#fff;color:var(--ink);font:inherit}
-.co[aria-expanded="true"]{background:var(--aqua);border-color:var(--ink)}
-.co b{font-weight:600}
-.co .n{font-family:var(--display);font-weight:700;font-size:.8rem;color:var(--link);white-space:nowrap}
-.co .k{grid-column:1 / -1;height:6px;border-radius:3px;background:rgb(var(--ink-rgb) / .1);overflow:hidden}
-.co .k i{display:block;height:100%;background:var(--rise);border-radius:3px}
-.detail{margin:0;padding:10px 12px;border-radius:12px;background:rgb(var(--blue-rgb) / .12);font-size:.93rem}
-.detail p{margin:0 0 4px}.detail p:last-child{margin:0}
-.lbl{font-family:var(--display);font-weight:700;font-size:.7rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
-.next{margin:22px 0 0;color:var(--muted);font-size:.93rem;max-width:46rem}
-@media (prefers-reduced-motion:reduce){*{transition:none!important}}
-
-.row .t a{color:var(--ink);text-decoration:none}
-.row .t a:hover{text-decoration:underline;color:var(--link)}
-.empty{margin:0;padding:10px 12px;border-radius:12px;background:rgb(176 230 226 / .45);font-size:.95rem}
-.co .n.v{color:var(--ink)}
-.detail a{color:var(--link)}
-</style>
-</head><body>
-<div class="page">
-  <a class="back" href="/">&larr; Home</a>
-  <h1>Contracts &amp; Suppliers</h1>
-  <p class="sample" id="upd" style="border-style:solid"></p>
-  <div class="tabs" role="tablist" aria-label="Section">
-    <button class="tab" role="tab" id="tab-c" aria-selected="true">Contract Awards</button>
-    <button class="tab" role="tab" id="tab-s" aria-selected="false">Supplier Map</button>
-  </div>
-  <div class="chips" id="chips" role="group" aria-label="Filter by technology area"></div>
-  <div id="view"></div>
-  <p class="next" id="next"></p>
-</div>
-<script>
-var $ = function (s) { return document.querySelector(s); };
-function el(t, text, cls) { var e = document.createElement(t); if (text != null) e.textContent = text; if (cls) e.className = cls; return e; }
-function safeUrl(u) { return /^https:\/\//i.test(u || '') ? u : ''; }
-var D = { areas: [], awards: [], suppliers: {} }, view = 'c', area = 'All', open = null, polls = 0;
-
-function money(v) {
-  if (v >= 1e9) return '$' + (v / 1e9).toFixed(2) + ' B';
-  if (v >= 1e6) return '$' + (v / 1e6).toFixed(1) + ' M';
-  return '$' + Math.round(v / 1e3).toLocaleString() + ' K';
-}
-function chips() {
-  var box = $('#chips'); box.replaceChildren();
-  ['All'].concat(D.areas).forEach(function (a) {
-    var b = el('button', a, 'chip'); b.type = 'button';
-    b.setAttribute('aria-pressed', String(a === area));
-    b.onclick = function () { area = a; draw(); };
-    box.append(b);
-  });
-}
-function contracts() {
-  var rows = D.awards.filter(function (a) { return area === 'All' || a.area === area; });
-  var wrap = el('div');
-  if (!D.awards.length) { wrap.append(el('p', D.updating ? 'Collecting this month’s contract awards. This page fills in shortly.' : (D.error || 'No awards saved yet. The next update will fill this in.'), 'empty')); return wrap; }
-  var totals = {};
-  D.awards.forEach(function (a) { totals[a.area] = (totals[a.area] || 0) + a.value; });
-  var p = el('div', null, 'panel');
-  p.append(el('h2', 'Award value by area'), el('p', 'Total value of the awards listed below, last ' + D.window_days + ' days.', 'sub'));
-  var bars = el('div', null, 'bars'), max = Math.max.apply(null, Object.keys(totals).map(function (k) { return totals[k]; }));
-  D.areas.slice().sort(function (a, b) { return (totals[b] || 0) - (totals[a] || 0); }).forEach(function (k) {
-    if (!totals[k]) return;
-    var r = el('div', null, 'brow'), tr = el('div', null, 'track'), f = el('div', null, 'fill');
-    f.style.width = (totals[k] / max * 100) + '%'; tr.append(f);
-    r.append(el('span', k, 'lab'), tr, el('span', money(totals[k]), 'val'));
-    bars.append(r);
-  });
-  p.append(bars);
-  var l = el('div', null, 'panel');
-  l.append(el('h2', 'Latest awards (' + rows.length + ')'), el('p', 'Value is the total amount on the award, which can include earlier funding.', 'sub'));
-  var ul = el('ul', null, 'list');
-  rows.slice(0, 60).forEach(function (a) {
-    var li = el('li', null, 'row'), mid = el('div'), t = el('span', null, 't');
-    var u = safeUrl(a.url);
-    if (u) { var an = el('a', a.what || a.who); an.href = u; an.target = '_blank'; an.rel = 'noopener'; t.append(an); } else t.textContent = a.what || a.who;
-    mid.append(t, el('span', a.who + (a.agency ? ' · ' + a.agency : ''), 's'), el('span', a.area, 'tag'));
-    li.append(el('span', a.date, 'd'), mid, el('span', money(a.value), 'v'));
-    ul.append(li);
-  });
-  if (!rows.length) ul.append(el('li', 'No awards in this area in the last ' + D.window_days + ' days.', 'empty'));
-  l.append(ul); wrap.append(p, l);
-  return wrap;
-}
-function suppliers() {
-  var wrap = el('div', null, 'lanes');
-  if (!Object.keys(D.suppliers).length) { var e = el('p', D.updating ? 'Collecting supplier data. This page fills in shortly.' : 'No supplier data yet. It is built from the contract awards.', 'empty'); wrap.append(e); return wrap; }
-  D.areas.forEach(function (k) {
-    var list = D.suppliers[k];
-    if (!list || (area !== 'All' && area !== k)) return;
-    var lane = el('section', null, 'lane'); lane.append(el('h3', k));
-    var cos = el('div', null, 'cos'), top = Math.max.apply(null, list.map(function (c) { return c.value; }));
-    list.forEach(function (c) {
-      var id = k + '|' + c.name, b = el('button', null, 'co'); b.type = 'button';
-      b.setAttribute('aria-expanded', String(open === id));
-      b.append(el('b', c.name), el('span', money(c.value), 'n v'));
-      var bar = el('span', null, 'k'), i = el('i'); i.style.width = (c.value / top * 100) + '%'; bar.append(i); b.append(bar);
-      b.onclick = function () { open = open === id ? null : id; draw(); };
-      cos.append(b);
-      if (open === id) {
-        var d = el('div', null, 'detail');
-        var p1 = el('p'); p1.append(el('span', 'Awards ', 'lbl'), document.createTextNode(c.awards + ' in the last ' + D.window_days + ' days · in your news log ' + c.mentions + ' time' + (c.mentions === 1 ? '' : 's')));
-        var p2 = el('p'); p2.append(el('span', 'Latest ', 'lbl'));
-        var u = safeUrl(c.latest_url);
-        if (u) { var an = el('a', c.latest || 'View award'); an.href = u; an.target = '_blank'; an.rel = 'noopener'; p2.append(an); } else p2.append(document.createTextNode(c.latest));
-        d.append(p1, p2); cos.append(d);
-      }
-    });
-    lane.append(cos); wrap.append(lane);
-  });
-  return wrap;
-}
-function draw() {
-  $('#tab-c').setAttribute('aria-selected', String(view === 'c'));
-  $('#tab-s').setAttribute('aria-selected', String(view === 's'));
-  chips(); $('#view').replaceChildren(view === 'c' ? contracts() : suppliers());
-  $('#next').textContent = view === 'c'
-    ? 'Source: public US government contract data (USAspending.gov), Department of Defense awards, refreshed daily. Links open the official award record.'
-    : 'Suppliers are the top recipients of the awards above, ranked by total value. “In your news log” counts how often the name appears in saved Top 10 News headlines.';
-  $('#upd').textContent = D.updated_label ? 'Updated ' + D.updated_label : '';
-}
-function load() {
-  fetch('/api/contracts').then(function (r) { return r.json(); }).then(function (j) {
-    D = j; draw();
-    if (j.updating && !j.awards.length && polls++ < 30) setTimeout(load, 8000);
-  }).catch(function () { $('#view').replaceChildren(el('p', 'Could not load contract data.', 'empty')); });
-}
-$('#tab-c').onclick = function () { view = 'c'; draw(); };
-$('#tab-s').onclick = function () { view = 's'; draw(); };
-load();
-</script>
-</body></html>"""
-
-
-HOME = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>GW Dashboard</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Jost:wght@500;700&family=Zilla+Slab:ital,wght@0,400;0,600;1,400;1,600&display=swap">
-<style>
-/* Layout: one column as wide as the title; header at the top, dictionary entry and a 2 x 3 button grid share its left and right edges. */
-:root{
-  color-scheme:light;
-  --bg:#dcebfa;
-  --ink:#26324f;
-  --muted:#52638a;
-  --sky:#a9d1f5;
-  --peri:#b3bff2;
-  --aqua:#bfe8e3;
-  --butter:#f7e7b0;
-  --peach:#f4b8a4;
-  --blue:#6f8be0;
-  --link:#2f4fa2;
-  --ink-rgb:38 50 79;
-  --blue-rgb:111 139 224;
-  --peri-rgb:150 160 240;
-  --aqua-rgb:176 230 226;
-  --x1:color-mix(in srgb,var(--blue) 80%,var(--ink));
-  --x2:color-mix(in srgb,var(--blue) 72%,var(--ink));
-  --x3:color-mix(in srgb,var(--blue) 64%,var(--ink));
-  --x4:color-mix(in srgb,var(--blue) 56%,var(--ink));
-  --x5:color-mix(in srgb,var(--blue) 48%,var(--ink));
-  --x6:color-mix(in srgb,var(--blue) 40%,var(--ink));
-  --x7:color-mix(in srgb,var(--blue) 32%,var(--ink));
-  --x8:color-mix(in srgb,var(--blue) 24%,var(--ink));
+  color-scheme:dark;
+  --bg:#0d1216;
+  --ink:#d9e2d6;
+  --muted:#8e9c93;
+  --line:#34434b;
+  --panel:rgb(16 23 28 / .94);
+  --panel2:#18222a;
+  --sea:#142029;
+  --land:#2e3829;
+  --land-edge:#5f6d55;
+  --has:#4a5a3c;
+  --sel:#6f5521;
+  --accent:#e3b34a;
+  --accent-ink:#1c1505;
+  --token:#cbbd92;
+  --token-ink:#1b1f17;
+  --barh:64px;
   --display:"Jost","Futura","Century Gothic","Avenir Next",system-ui,sans-serif;
   --body:"Zilla Slab","Archer","Rockwell",Georgia,serif;
 }
 [hidden]{display:none!important}
 html,body{height:100%}
-body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--body);overflow-x:hidden}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--body);overflow:hidden}
+button{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
-.stage{position:relative;min-height:100%;box-sizing:border-box;overflow:hidden;display:grid;place-items:start center;padding-inline:16px;padding-top:clamp(20px,4vh,40px);padding-bottom:56px}
-.stage::before{content:"";position:absolute;inset:0;pointer-events:none;background:
-  radial-gradient(60% 50% at 12% 6%,rgb(var(--peri-rgb) / .45),transparent 70%),
-  radial-gradient(55% 45% at 94% 96%,rgb(var(--aqua-rgb) / .80),transparent 70%)}
+/* the board fills the window */
+#map{position:fixed;inset:0;overflow:hidden;background:var(--sea)}
+#map svg{display:block;width:100%;height:100%;cursor:grab}
+#map svg:active{cursor:grabbing}
+.vig{position:absolute;inset:0;pointer-events:none;background:radial-gradient(ellipse at 50% 55%,transparent 55%,rgb(0 0 0 / .5))}
+.land{fill:var(--land);stroke:var(--land-edge);stroke-width:.6;vector-effect:non-scaling-stroke}
+.land.has{fill:var(--has);cursor:pointer}
+.land.sel{fill:var(--sel);stroke:var(--accent);stroke-width:1.4}
+.grid{stroke:rgb(150 185 150 / .14);stroke-width:.8;vector-effect:non-scaling-stroke}
+.grid.major{stroke:rgb(227 179 74 / .4);stroke-width:1;stroke-dasharray:6 5}
+.edge{fill:none;stroke:rgb(150 185 150 / .35);stroke-width:1.2;vector-effect:non-scaling-stroke}
+.tick{font-family:var(--display);font-weight:700;font-size:10px;letter-spacing:.12em;fill:rgb(217 226 214 / .55);paint-order:stroke;stroke:var(--sea);stroke-width:3px;pointer-events:none}
+.ctr{cursor:pointer}
+.ctr .sh{fill:#000;opacity:.7}
+.ctr .face{fill:var(--token);stroke:#000;stroke-width:1.2}
+.ctr.on .face{fill:var(--accent)}
+.ctr .cd{font-family:var(--display);font-weight:700;font-size:10px;letter-spacing:.08em;fill:var(--token-ink);text-anchor:middle;dominant-baseline:central}
+.ctr .bd{fill:var(--panel2);stroke:var(--accent);stroke-width:1.2}
+.ctr .bn{font-family:var(--display);font-weight:700;font-size:9px;fill:var(--accent);text-anchor:middle;dominant-baseline:central}
+.msg{position:absolute;inset:0;display:grid;place-items:center;padding:16px;pointer-events:none}
+.msg p{margin:0;max-width:22rem;padding:12px 18px;border:1px solid var(--line);border-radius:12px;background:var(--panel);text-align:center;font-size:1rem;line-height:1.45}
+.msg.err p{color:#f0a08a}
 
-.floor{position:absolute;left:-50%;right:-50%;top:55%;height:100%;pointer-events:none;
-  background-image:
-    linear-gradient(rgb(var(--blue-rgb) / .30) 1.5px,transparent 1.5px),
-    linear-gradient(90deg,rgb(var(--blue-rgb) / .30) 1.5px,transparent 1.5px);
-  background-size:72px 72px;
-  transform:perspective(420px) rotateX(62deg);transform-origin:50% 0;
-  -webkit-mask-image:linear-gradient(to bottom,transparent 0%,#000 40%);
-  mask-image:linear-gradient(to bottom,transparent 0%,#000 40%);
-  animation:drift 9s linear infinite}
-@keyframes drift{to{background-position:0 72px}}
+/* floating bar */
+.bar{position:fixed;top:0;left:0;right:0;z-index:5;display:grid;grid-template-columns:auto auto 1fr;align-items:center;gap:8px 18px;padding:12px 16px 20px;
+  background:linear-gradient(rgb(13 18 22 / .94) 55%,transparent);pointer-events:none}
+.bar>*{pointer-events:auto}
+.back{color:var(--muted);font-family:var(--display);font-weight:500;font-size:.9rem;letter-spacing:.06em;text-decoration:none}
+.back:hover{color:var(--ink);text-decoration:underline}
+h1{margin:0;justify-self:end;font-family:var(--display);font-weight:700;font-size:clamp(1.05rem,3vw,1.6rem);letter-spacing:.24em;text-transform:uppercase;line-height:1.1;white-space:nowrap;
+  color:var(--ink);text-shadow:2px 2px 0 rgb(227 179 74 / .5)}
+.pick{display:inline-flex;align-items:center;gap:8px;justify-self:start;cursor:pointer;padding:5px 11px 5px 13px;border-radius:999px;border:1.5px solid var(--accent);
+  background:rgb(227 179 74 / .1);color:var(--accent);font-family:var(--display);font-weight:700;font-size:.7rem;letter-spacing:.14em;text-transform:uppercase;white-space:nowrap;
+  box-shadow:0 2px 0 rgb(0 0 0 / .6)}
+.pick.set{background:var(--accent);color:var(--accent-ink)}
+.pick:active{transform:translateY(2px);box-shadow:none}
+.pick svg{width:10px;height:10px;fill:none;stroke:currentColor;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
+.ctrl{display:flex;flex-wrap:wrap;align-items:center;gap:8px;min-width:0}
+/* launcher button: solid and pulsing until a launcher is placed, so it is hard to miss */
+.launch{display:inline-flex;align-items:center;justify-content:center;gap:8px;cursor:pointer;padding:8px 16px;border-radius:999px;border:2px solid var(--accent);background:var(--accent);color:var(--accent-ink);
+  font-family:var(--display);font-weight:700;font-size:.78rem;letter-spacing:.12em;text-transform:uppercase;white-space:nowrap;box-shadow:0 3px 0 #000}
+.launch.nudge{animation:nudge 1.6s ease-out infinite}
+@keyframes nudge{0%{box-shadow:0 3px 0 #000,0 0 0 0 rgb(227 179 74 / .7)}70%{box-shadow:0 3px 0 #000,0 0 0 12px rgb(227 179 74 / 0)}100%{box-shadow:0 3px 0 #000,0 0 0 0 rgb(227 179 74 / 0)}}
+.launch.moved{background:var(--panel);color:var(--accent)}
+.launch[aria-pressed="true"]{background:#c8553d;border-color:#f0a08a;color:#fff}
+.launch:active{transform:translateY(2px);box-shadow:none}
+.launch svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round}
+.det .launch{width:100%;box-sizing:border-box;padding:11px 16px;font-size:.8rem}
+.ring-off{fill:rgb(224 72 60 / .13);stroke:rgb(240 96 80 / .85);stroke-width:1.5;stroke-dasharray:7 5;vector-effect:non-scaling-stroke;pointer-events:none}
+.ring-def{fill:rgb(80 140 240 / .13);stroke:rgb(120 170 255 / .85);stroke-width:1.5;stroke-dasharray:7 5;vector-effect:non-scaling-stroke;pointer-events:none}
+.key{display:inline-block;width:12px;height:12px;margin-right:6px;vertical-align:-2px;border-radius:50%;border:1.5px dashed}
+.key.off{background:rgb(224 72 60 / .25);border-color:#f06050}
+.key.def{background:rgb(80 140 240 / .25);border-color:#78aaff}
+#map svg.placing{cursor:crosshair}
+/* systems on the map: chips under the weapon button (red strike, blue defence) */
+.chips{grid-column:2 / -1;display:flex;flex-wrap:wrap;gap:6px}
+.chip{display:inline-flex;align-items:center;border-radius:999px;border:1.5px solid;background:var(--panel);box-shadow:0 2px 0 #000}
+.chip.off{border-color:#f06050;color:#f6a493}
+.chip.def{border-color:#78aaff;color:#a9c8ff}
+.chip.cur{box-shadow:0 0 0 2px rgb(255 255 255 / .25),0 2px 0 #000}
+.chip button{border:0;background:none;color:inherit;cursor:pointer;font-family:var(--display);font-weight:700;font-size:.72rem;letter-spacing:.06em}
+.chip .cs{display:inline-flex;align-items:center;gap:6px;padding:4px 4px 4px 10px}
+.chip .cx{padding:4px 9px 4px 6px;font-size:.78rem;opacity:.8}
+.chip .cx:hover{opacity:1}
+.cdot{width:8px;height:8px;border-radius:50%;background:currentColor}
+.land.held-off{stroke:#f06050;stroke-width:1.2}
+.land.held-def{stroke:#78aaff;stroke-width:1.2}
+.lnch.off .ring{stroke:#f06050}
+.lnch.def .ring{stroke:#78aaff}
+.lnch.off .pt{fill:#f06050}
+.lnch.def .pt{fill:#78aaff}
+.lname{font-family:var(--display);font-weight:700;font-size:10px;letter-spacing:.08em;text-anchor:middle;paint-order:stroke;stroke:#0d1216;stroke-width:3px}
+.lnch.off .lname{fill:#f6a493}
+.lnch.def .lname{fill:#a9c8ff}
+.lnch{pointer-events:none}
+.lnch .ring{fill:none;stroke:var(--accent);stroke-width:1.5;stroke-dasharray:3 3}
+.lnch .pt{fill:var(--accent);stroke:#000;stroke-width:1}
+.lnch .body{fill:var(--token);stroke:#000;stroke-width:1.2;stroke-linejoin:round}
+.lnch .tube{fill:#9a8d63;stroke:#000;stroke-width:1.2}
+.lnch .wh{fill:#1b1f17;stroke:var(--token);stroke-width:1}
+.toast{position:fixed;z-index:6;top:calc(var(--barh) + 6px);left:calc(50% + 166px);transform:translateX(-50%);max-width:min(26rem,calc(100% - 360px));box-sizing:border-box;
+  padding:10px 16px;border:1px solid var(--accent);border-radius:10px;background:var(--panel);color:var(--ink);font-size:.95rem;line-height:1.4;text-align:center;
+  box-shadow:0 10px 24px rgb(0 0 0 / .5)}
+.toast.err{border-color:#e07a5f;color:#f4b6a2}
 
-/* the title sets the column width; the entry and the grid take 0 width of their own and then stretch to match it */
-.col{position:relative;z-index:1;width:fit-content;max-width:100%;min-width:0;display:grid;gap:clamp(22px,4vh,34px)}
-.head{display:grid;gap:16px;min-width:0}
-h1{margin:0 -.12em 0 0;text-align:center;font-family:var(--display);font-weight:700;font-size:clamp(1.9rem,9.2vw,4.8rem);letter-spacing:.12em;text-transform:uppercase;line-height:1.1;text-wrap:balance;
-  color:var(--ink);text-shadow:4px 4px 0 var(--blue)}
+/* zoom controls */
+.zoom{position:fixed;right:14px;bottom:14px;z-index:4;display:grid;gap:6px}
+.zb{display:grid;place-items:center;width:36px;height:36px;cursor:pointer;border-radius:9px;border:1px solid var(--line);background:var(--panel);
+  font-family:var(--display);font-weight:700;font-size:1.1rem;line-height:1;box-shadow:0 2px 0 #000}
+.zb:active{transform:translateY(2px);box-shadow:none}
+.zb svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
 
-/* dictionary entry: three short lines, smaller than the header */
-.entry{width:0;min-width:100%;display:grid;gap:6px;text-align:left}
-.entry p{margin:0}
-.line1{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 12px;padding-bottom:8px;border-bottom:1.5px solid rgb(var(--ink-rgb) / .28)}
-.hw{font-weight:600;font-size:1.3rem;line-height:1.2}
-.pron{color:var(--muted);font-size:.95rem}
-.pos{font-style:italic;color:var(--link);font-size:.95rem}
-.def{font-size:1rem;line-height:1.5}
-.abbr{font-style:italic;color:var(--muted)}
-.lab{font-weight:600}
-.entry i{font-style:italic;color:var(--link)}
+/* roster: left panel on desktop */
+#roster{position:fixed;z-index:4;left:12px;top:var(--barh);bottom:12px;width:min(320px,calc(100% - 24px));display:flex;flex-direction:column;min-height:0;box-sizing:border-box;
+  border:1px solid var(--line);border-radius:14px;background:var(--panel);box-shadow:0 12px 30px rgb(0 0 0 / .45);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+.rh{display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--line)}
+.rtog{flex:1;min-width:0;display:grid;gap:2px;padding:12px 14px 10px;border:0;background:none;text-align:left;cursor:default}
+.rtog .grip{display:none}
+.peekact{display:none}
+/* placing mode: one slim strip with the instruction (or error) and Cancel */
+.placebar{position:fixed;z-index:6;top:calc(var(--barh) + 6px);left:calc(50% + 166px);transform:translateX(-50%);width:max-content;max-width:min(30rem,calc(100% - 360px));box-sizing:border-box;
+  display:flex;align-items:center;gap:10px;padding:8px 8px 8px 14px;border:1.5px solid var(--accent);border-radius:999px;background:var(--panel);box-shadow:0 10px 24px rgb(0 0 0 / .5)}
+.placebar svg{flex:none;width:16px;height:16px;fill:none;stroke:var(--accent);stroke-width:2;stroke-linecap:round}
+.placebar span{font-size:.92rem;line-height:1.3}
+.placebar.err{border-color:#e07a5f}
+.placebar.err span{color:#f4b6a2}
+.placebar button{flex:none;cursor:pointer;padding:6px 14px;border-radius:999px;border:0;background:#c8553d;color:#fff;
+  font-family:var(--display);font-weight:700;font-size:.72rem;letter-spacing:.12em;text-transform:uppercase}
+.rt{font-family:var(--display);font-weight:700;font-size:.9rem;letter-spacing:.2em;text-transform:uppercase;color:var(--accent)}
+.rc{color:var(--muted);font-size:.86rem}
+.rl{overflow-y:auto;overscroll-behavior:contain;padding:8px 10px 10px;display:grid;gap:6px;align-content:start;flex:1;min-height:0}
+.nation{padding:8px;border-radius:10px;border:1px solid transparent}
+.nation.on{border-color:var(--line);background:rgb(255 255 255 / .04)}
+.nn{display:flex;align-items:center;gap:10px;width:100%;padding:2px 2px 8px;border:0;background:none;cursor:pointer;text-align:left}
+.tok{flex:none;display:grid;place-items:center;width:40px;height:24px;border:1px solid #000;border-radius:3px;background:var(--token);color:var(--token-ink);
+  font-family:var(--display);font-weight:700;font-size:.68rem;letter-spacing:.08em;box-shadow:2px 2px 0 rgb(0 0 0 / .7)}
+.nation.on .tok{background:var(--accent)}
+.cn{flex:1;min-width:0;font-weight:600;font-size:1.02rem;line-height:1.2}
+.cnt{flex:none;color:var(--muted);font-size:.82rem}
+.wrow{display:flex;flex-wrap:wrap;gap:7px}
+.wb{display:inline-flex;align-items:center;gap:7px;max-width:100%;cursor:pointer;padding:5px 11px;border-radius:999px;border:1px solid #4a5a62;background:#1f2a32;
+  font-family:var(--display);font-weight:500;font-size:.82rem;letter-spacing:.03em;line-height:1.2;text-align:left;box-shadow:0 2px 0 #000}
+.wb:hover{border-color:var(--muted)}
+.wb:active{transform:translateY(2px);box-shadow:none}
+.wb[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:700}
+.dot{flex:none;width:8px;height:8px;border-radius:50%;border:1px solid rgb(0 0 0 / .6)}
+.legend{display:flex;flex-wrap:wrap;gap:4px 12px;padding:8px 14px 10px;border-top:1px solid var(--line);color:var(--muted);font-size:.78rem}
+.legend span{display:inline-flex;align-items:center;gap:5px}
+.s-in-service{background:#6fbf8e}
+.s-reported{background:#8fd0c6}
+.s-fielding{background:#7d98ec}
+.s-tested{background:#e3c35a}
+.s-dev{background:transparent;border-color:#c8d0d8!important}
+.s-claimed{background:#e08a6a}
+.foot{margin:0;padding:0 14px 10px;color:var(--muted);font-size:.75rem;line-height:1.4}
 
-/* 2 columns x 3 rows of mode buttons; the first slot is the live one */
-.grid{width:0;min-width:100%;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-auto-rows:1fr;gap:22px 16px;padding-bottom:8px}
+/* weapon detail, shown under the chosen country */
+.det{margin:4px 2px 0;padding:14px 8px 4px;border-top:1px solid var(--line);display:grid;gap:10px}
+.dn{margin:0;font-family:var(--display);font-weight:700;font-size:1.25rem;letter-spacing:.05em;line-height:1.2;color:var(--accent);overflow-wrap:anywhere}
+.dk{margin:-6px 0 0;color:var(--muted);font-size:.92rem}
+.pill{justify-self:start;display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border:1px solid var(--line);border-radius:999px;
+  font-family:var(--display);font-weight:700;font-size:.68rem;letter-spacing:.12em;text-transform:uppercase}
+.dd{margin:0;font-size:.98rem;line-height:1.5}
+.stats{margin:0;display:grid;gap:6px}
+.stat{display:grid;grid-template-columns:4.4rem minmax(0,1fr);gap:10px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:rgb(0 0 0 / .2)}
+.stat dt{margin:0;padding-top:.2em;font-family:var(--display);font-weight:700;font-size:.68rem;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.stat dd{margin:0;font-size:.95rem;line-height:1.4;overflow-wrap:anywhere}
+.dnote{margin:0;color:var(--muted);font-size:.8rem;font-style:italic}
+.il{justify-self:start;color:var(--accent);font-weight:600;font-size:.92rem}
 
-.mode{display:block;height:100%;color:inherit;text-decoration:none;outline:none;-webkit-tap-highlight-color:transparent}
-.face{--stack:0 1px 0 var(--x1),0 2px 0 var(--x2),0 3px 0 var(--x3),0 4px 0 var(--x4),0 5px 0 var(--x5),0 6px 0 var(--x6),0 7px 0 var(--x7),0 8px 0 var(--x8);
-  --glow:0 20px 26px -12px rgb(var(--ink-rgb) / .36);
-  position:relative;display:flex;flex-direction:column;align-items:flex-start;gap:8px;box-sizing:border-box;height:100%;padding:clamp(14px,3.6vw,24px);border-radius:22px;
-  background:linear-gradient(150deg,#f5faff,var(--sky) 60%,#9db5ee);
-  border:2px solid var(--ink);
-  box-shadow:inset 0 2px 0 rgb(255 255 255 / .65),var(--stack),var(--glow);
-  transition:transform .16s ease-out,box-shadow .16s ease-out}
-.sheen{position:absolute;inset:0;border-radius:inherit;pointer-events:none;
-  background:radial-gradient(200px circle at 26% 0%,rgb(255 255 255 / .55),transparent 62%)}
-.glyph{width:clamp(38px,10vw,54px);height:clamp(38px,10vw,54px);flex:none}
-.g-bar{stroke:var(--ink);stroke-width:2.2;stroke-linejoin:round}
-.g-bar.b1{fill:var(--peri)}
-.g-bar.b2{fill:var(--aqua)}
-.g-bar.b3{fill:var(--butter)}
-.g-line{fill:none;stroke:var(--ink);stroke-width:3;stroke-linecap:round;stroke-linejoin:round}
-.g-dot{fill:var(--peach);stroke:var(--ink);stroke-width:2.2}
-.title{margin:0;font-family:var(--display);font-weight:700;font-size:clamp(1rem,3.8vw,1.4rem);letter-spacing:.08em;text-transform:uppercase;line-height:1.2;color:var(--ink)}
-.sub{margin:0 0 8px;color:var(--muted);font-size:clamp(.82rem,2.6vw,1rem);line-height:1.4}
-.go{display:inline-flex;align-items:center;gap:8px;margin-top:auto;padding:6px 14px;border-radius:999px;border:2px solid var(--ink);
-  background:var(--aqua);color:var(--ink);font-family:var(--display);font-weight:700;font-size:.72rem;letter-spacing:.16em;text-transform:uppercase}
-.go svg{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
+/* weapon picker */
+dialog{width:min(420px,calc(100vw - 32px));max-height:calc(100dvh - 40px);overflow-y:auto;overscroll-behavior:contain;box-sizing:border-box;padding:18px;border:1px solid var(--line);border-radius:14px;color:var(--ink);background:var(--panel2);box-shadow:0 24px 48px rgb(0 0 0 / .6)}
+dialog::backdrop{background:rgb(0 0 0 / .55)}
+.dh{margin:0 0 2px;font-family:var(--display);font-weight:700;font-size:.95rem;letter-spacing:.2em;text-transform:uppercase;color:var(--accent)}
+.ds{margin:0 0 14px;color:var(--muted);font-size:.92rem}
+.opts{display:grid;gap:8px}
+.grp{margin:8px 0 0;font-family:var(--display);font-weight:700;font-size:.7rem;letter-spacing:.2em;text-transform:uppercase}
+.grp:first-child{margin-top:0}
+.grp.off{color:#f6a493}
+.grp.def{color:#a9c8ff}
+.opt{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;align-items:center;width:100%;cursor:pointer;padding:12px 14px;text-align:left;border:1px solid var(--line);border-radius:10px;
+  background:#1f2a32;box-shadow:0 2px 0 #000}
+.opt:hover{border-color:var(--muted)}
+.opt:active{transform:translateY(2px);box-shadow:none}
+.opt[aria-pressed="true"]{border-color:var(--accent)}
+.opt svg{grid-row:span 2;width:34px;height:34px}
+.on1{font-family:var(--display);font-weight:700;font-size:.9rem;letter-spacing:.14em;text-transform:uppercase}
+.on2{color:var(--muted);font-size:.86rem;line-height:1.35}
+.soon{margin:12px 0 0;color:var(--muted);font-size:.84rem;font-style:italic;text-align:center}
 
-@media (hover:hover){
-  .mode:hover .face{transform:translateY(-5px);--glow:0 30px 36px -12px rgb(var(--ink-rgb) / .44)}
+/* phone: one slim header row; the roster is a bottom sheet that tucks away when you use the map;
+   while placing a launcher only the map and the placing strip are shown */
+@media (max-width:720px){
+  .bar{grid-template-columns:auto minmax(0,1fr) auto;gap:10px;padding:10px 12px 16px}
+  .back{font-size:1.25rem;line-height:1}
+  .bk{display:none}
+  .bar h1{font-size:.8rem;letter-spacing:.14em;white-space:normal;text-align:right;line-height:1.15}
+  .chips{grid-column:1 / -1}
+  #launch{display:none!important}
+  .toast,.placebar{left:50%;max-width:calc(100% - 24px)}
+  body.placing .bar,body.placing #roster{display:none}
+  body.placing .placebar{top:12px}
+  #roster{left:0;right:0;top:auto;bottom:0;width:auto;max-height:58%;border-width:1px 0 0;border-radius:16px 16px 0 0;transition:transform .25s ease-out}
+  #roster.closed{transform:translateY(calc(100% - 62px))}
+  .rh{position:relative}
+  .rtog{cursor:pointer;padding:16px 6px 10px 14px;min-height:62px;box-sizing:border-box}
+  .rtog .grip{display:block;position:absolute;left:50%;top:6px;transform:translateX(-50%);width:40px;height:4px;border-radius:2px;background:var(--muted)}
+  .rc{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .peekact:not([hidden]){display:inline-flex;flex:none;align-items:center;margin-right:12px;cursor:pointer;padding:8px 14px;border-radius:999px;border:2px solid var(--accent);
+    background:var(--accent);color:var(--accent-ink);font-family:var(--display);font-weight:700;font-size:.72rem;letter-spacing:.1em;text-transform:uppercase;box-shadow:0 2px 0 #000}
+  .peekact.moved{background:var(--panel);color:var(--accent)}
+  .det .launch{display:none}   /* the sheet's strip already has this button */
+  .foot{display:none}
+  #zin,#zout{display:none}
+  .zoom{bottom:74px}
 }
-.mode:active .face{transform:translateY(6px);--stack:0 1px 0 var(--x1),0 2px 0 var(--x2);--glow:0 8px 16px -8px rgb(var(--ink-rgb) / .40)}
-.mode:focus-visible .face{outline:3px solid var(--link);outline-offset:6px}
-
-.note{margin:0;color:var(--muted);font-size:.95rem;text-align:center}
-
-@media (prefers-reduced-motion:reduce){
-  .floor{animation:none}
-  .face{transition:none}
-}
+@media (prefers-reduced-motion:reduce){#roster{transition:none}.launch.nudge{animation:none}}
 </style>
-</head><body><div class="stage">
-  <div class="floor" aria-hidden="true"></div>
-  <main class="col">
-    <header class="head">
-      <h1>GW Dashboard</h1>
-      <div class="entry">
-        <p class="line1"><span class="hw">guid·ed weap·on</span><span class="pron">/ˈɡaɪ·dɪd ˈwɛp·ən/</span><span class="pos">n.</span></p>
-        <p class="def">A munition that steers itself toward a target after launch, using onboard guidance. <span class="abbr">Abbr. GW.</span></p>
-        <p class="def"><span class="lab">Parts:</span> <i>seeker</i>, <i>guidance</i>, <i>propulsion</i>, <i>datalink</i>.</p>
-      </div>
-    </header>
+</head><body>
+<main id="map" aria-label="World map">
+  <div class="vig" aria-hidden="true"></div>
+  <div class="msg" id="msg"><p>Loading the map…</p></div>
+</main>
+<header class="bar" id="bar">
+  <a class="back" href="/" aria-label="Home">&larr;<span class="bk"> Home</span></a>
+  <div class="ctrl">
+    <button class="pick" id="pick" type="button" aria-haspopup="dialog"><span id="pickt">Choose your Weapon</span>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 6l5 5 5-5"/></svg></button>
+    <button class="launch" id="launch" type="button" aria-pressed="false" hidden>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5"/><path d="M8 1v3M8 12v3M1 8h3M12 8h3"/></svg>
+      <span class="lt">Select Launcher Position</span></button>
+  </div>
+  <h1>Battle Lab</h1>
+  <div class="chips" id="chips" aria-label="On the map" hidden></div>
+</header>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+<div class="placebar" id="placebar" role="status" aria-live="polite" hidden>
+  <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5"/><path d="M8 1v3M8 12v3M1 8h3M12 8h3"/></svg>
+  <span id="placemsg"></span>
+  <button type="button" id="placecancel">Cancel</button>
+</div>
+<div class="zoom" id="zoom" hidden>
+  <button class="zb" id="zin" type="button" aria-label="Zoom in">+</button>
+  <button class="zb" id="zout" type="button" aria-label="Zoom out">&minus;</button>
+  <button class="zb" id="zfit" type="button" aria-label="Show the whole world">
+    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 7V3h4M13 3h4v4M17 13v4h-4M7 17H3v-4"/></svg></button>
+</div>
+<aside id="roster" hidden aria-live="polite">
+  <div class="rh">
+    <button class="rtog" id="rh" type="button" aria-expanded="true">
+      <span class="grip" aria-hidden="true"></span>
+      <span class="rt" id="rt"></span>
+      <span class="rc" id="rc"></span>
+    </button>
+    <button class="peekact" id="peekact" type="button" hidden></button>
+  </div>
+  <div class="rl" id="rl"></div>
+  <div class="legend" id="legend"></div>
+  <p class="foot">From public reporting. Figures and status are approximate; follow the link for sources.</p>
+</aside>
 
-    <div class="grid">
-      <a class="mode" href="/trends">
-        <span class="face">
-          <span class="sheen" aria-hidden="true"></span>
-          <svg class="glyph" viewBox="0 0 64 64" aria-hidden="true">
-            <rect class="g-bar b1" x="7" y="40" width="10" height="18" rx="2"/>
-            <rect class="g-bar b2" x="22" y="30" width="10" height="28" rx="2"/>
-            <rect class="g-bar b3" x="37" y="20" width="10" height="38" rx="2"/>
-            <polyline class="g-line" points="8,30 23,21 38,25 55,8"/>
-            <circle class="g-dot" cx="55" cy="8" r="5"/>
-          </svg>
-          <h2 class="title">Top 10 News</h2>
-          <p class="sub">Live updates on the latest news and trends on GW.</p>
-          <span class="go">Open
-            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 2.5 10.5 8 5 13.5"/></svg>
-          </span>
-        </span>
-      </a>
-      <a class="mode" href="/research">
-        <span class="face">
-          <span class="sheen" aria-hidden="true"></span>
-          <svg class="glyph" viewBox="0 0 64 64" aria-hidden="true">
-            <circle cx="26" cy="26" r="16" fill="#bfe8e3" stroke="#26324f" stroke-width="2.4"/>
-            <path d="M17 24a10 10 0 0 1 9-9" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
-            <line x1="38" y1="38" x2="56" y2="56" stroke="#26324f" stroke-width="6" stroke-linecap="round"/>
-            <line x1="38" y1="38" x2="56" y2="56" stroke="#f7e7b0" stroke-width="2.4" stroke-linecap="round"/>
-            <circle cx="26" cy="26" r="4" fill="#f4b8a4" stroke="#26324f" stroke-width="2"/>
-          </svg>
-          <h2 class="title">Market Research</h2>
-          <p class="sub">Find the closest published systems to your technical parameters.</p>
-          <span class="go">Open
-            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 2.5 10.5 8 5 13.5"/></svg>
-          </span>
-        </span>
-      </a>
-      <a class="mode" href="/contracts">
-        <span class="face">
-          <span class="sheen" aria-hidden="true"></span>
-          <svg class="glyph" viewBox="0 0 64 64" aria-hidden="true">
-            <rect x="12" y="8" width="34" height="46" rx="4" fill="#f7e7b0" stroke="#26324f" stroke-width="2.4"/>
-            <line x1="19" y1="20" x2="39" y2="20" stroke="#26324f" stroke-width="3" stroke-linecap="round"/>
-            <line x1="19" y1="29" x2="39" y2="29" stroke="#26324f" stroke-width="3" stroke-linecap="round"/>
-            <line x1="19" y1="38" x2="31" y2="38" stroke="#26324f" stroke-width="3" stroke-linecap="round"/>
-            <circle cx="46" cy="46" r="11" fill="#bfe8e3" stroke="#26324f" stroke-width="2.4"/>
-            <path d="M41 46l4 4 7-8" fill="none" stroke="#26324f" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
-          <h2 class="title">Contracts &amp; Suppliers</h2>
-          <p class="sub">Public contract awards and who is winning the work.</p>
-          <span class="go">Open
-            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 2.5 10.5 8 5 13.5"/></svg>
-          </span>
-        </span>
-      </a>
-      <a class="mode" href="/standards">
-        <span class="face">
-          <span class="sheen" aria-hidden="true"></span>
-          <svg class="glyph" viewBox="0 0 64 64" aria-hidden="true">
-            <rect x="8" y="12" width="14" height="44" rx="2" fill="#b3bff2" stroke="#26324f" stroke-width="2.4"/>
-            <rect x="25" y="8" width="14" height="48" rx="2" fill="#bfe8e3" stroke="#26324f" stroke-width="2.4"/>
-            <rect x="42" y="16" width="14" height="40" rx="2" fill="#f7e7b0" stroke="#26324f" stroke-width="2.4" transform="rotate(8 49 36)"/>
-            <line x1="11" y1="22" x2="19" y2="22" stroke="#26324f" stroke-width="2.4" stroke-linecap="round"/>
-            <line x1="28" y1="18" x2="36" y2="18" stroke="#26324f" stroke-width="2.4" stroke-linecap="round"/>
-            <circle cx="32" cy="44" r="3.5" fill="#f4b8a4" stroke="#26324f" stroke-width="2"/>
-          </svg>
-          <h2 class="title">Standards Library</h2>
-          <p class="sub">Free military and space standards, with team notes.</p>
-          <span class="go">Open
-            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 2.5 10.5 8 5 13.5"/></svg>
-          </span>
-        </span>
-      </a>
+<dialog id="dlg" aria-labelledby="dh">
+  <p class="dh" id="dh">Choose your Weapon</p>
+  <p class="ds">Pick a weapon type to see who has it.</p>
+  <div class="opts" id="opts"></div>
+  <p class="soon">Launchers are placed on land, inside the system's own country.</p>
+</dialog>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/topojson-client@3.1.0/dist/topojson-client.min.js"></script>
+<script>
+var DATA = __BATTLE_DATA__;
+var WORLD_URL = 'https://cdn.jsdelivr.net/npm/world-atlas@2.0.2/countries-110m.json';
+var STATUS = [['In service', 's-in-service'], ['Reported in service', 's-reported'], ['Fielding', 's-fielding'],
+              ['Tested', 's-tested'], ['In development', 's-dev'], ['Claimed', 's-claimed']];
+var TOP = 84, BOTTOM = -58;            // latitudes shown; the far south is cropped
+var SPAN = (TOP - BOTTOM) / 360;       // natural height / width of the map
+var MAX_STRETCH = 1.6;                 // desktop: how far north-south may stretch to fill the screen
+var PANEL = 332;                       // desktop roster width incl. margin
+
+function $(s) { return document.querySelector(s); }
+function el(tag, text, cls) { var e = document.createElement(tag); if (text != null) e.textContent = text; if (cls) e.className = cls; return e; }
+function statusClass(s) { for (var i = 0; i < STATUS.length; i++) if (STATUS[i][0] === s) return STATUS[i][1]; return 's-dev'; }
+function phone() { return window.matchMedia('(max-width: 720px)').matches; }
+function slow() { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; }
+function barH() { return $('#bar').offsetHeight; }
+
+var mode = null, selIso = null, selSys = null;   // the category, country and system being looked at
+var placing = false;
+// What is on the map: one strike and one defence system, each { cat, c: country, s: system, at: [lon, lat] or null }.
+// Picking another system of the same group replaces it; the chip's ✕ removes it.
+var slots = { Strike: null, Defence: null };
+function grpOf(cat) { return DATA[cat].group; }
+function selSlot() { var g = mode && grpOf(mode); return selSys && slots[g] && slots[g].s === selSys ? slots[g] : null; }
+function curLauncher() { var sl = selSlot(); return sl ? sl.at : null; }
+function placed() { return ['Strike', 'Defence'].map(function (g) { return slots[g]; }).filter(function (sl) { return sl && sl.at; }); }
+var features = null, W = 0, H = 0, sy = 1, proj, path, svg, gWorld, gRing, gTicks, gCtr, gLaunch, zoom, box, T = d3.zoomIdentity, hexPat, lands;
+var KM_PER_DEG = 111.195;   // great-circle km per degree on a 6,371 km Earth
+
+/* Equirectangular, optionally stretched north-south: lines of latitude and longitude stay straight. */
+function P(ll) { var p = proj(ll); return [p[0], p[1] * sy]; }
+
+/* ---------- map ---------- */
+function build() {
+  var host = $('#map');
+  if (svg) svg.remove();
+  W = host.clientWidth; H = host.clientHeight;
+  var natH = W * SPAN;
+  sy = phone() ? 1 : Math.max(1, Math.min(H / natH, MAX_STRETCH));
+  proj = d3.geoEquirectangular().scale(W / (2 * Math.PI)).center([0, TOP]).translate([W / 2, 0]);
+  var stretch = d3.geoTransform({ point: function (x, y) { this.stream.point(x, y * sy); } });
+  path = d3.geoPath({ stream: function (s) { return proj.stream(stretch.stream(s)); } });
+  box = [[0, 0], [W, natH * sy]];
+  var bw = W, bh = natH * sy;
+
+  svg = d3.select(host).insert('svg', ':first-child').attr('viewBox', '0 0 ' + W + ' ' + H).attr('role', 'img').attr('aria-label', 'Flat world map with latitude and longitude grid');
+  var defs = svg.append('defs');
+  defs.append('clipPath').attr('id', 'mapclip').append('rect').attr('width', bw).attr('height', bh);
+  hexPat = defs.append('pattern').attr('id', 'hex').attr('patternUnits', 'userSpaceOnUse').attr('width', 36).attr('height', 20.78);
+  hexPat.append('path').attr('d', 'M0,10.39 L6,0 L18,0 L24,10.39 L18,20.78 L6,20.78 Z M24,10.39 L36,10.39')
+    .attr('fill', 'none').attr('stroke', 'rgb(160 200 160 / .07)').attr('stroke-width', 1);
+
+  gWorld = svg.append('g');
+  gWorld.append('rect').attr('width', bw).attr('height', bh).attr('fill', 'var(--sea)');
+  lands = gWorld.append('g').selectAll('path').data(features).join('path')
+    .attr('class', 'land').attr('d', path)
+    .on('click', function (ev, d) { if (placing) return; var c = countryByIso(d.id); if (c) pickCountry(c, false, true); });
+  lands.append('title').text(function (d) { return d.properties.name; });
+
+  var gGrid = gWorld.append('g');
+  for (var lon = -180; lon <= 180; lon += 15) {
+    var x = P([lon, 0])[0];
+    gGrid.append('line').attr('class', 'grid' + (lon === 0 ? ' major' : '')).attr('x1', x).attr('x2', x).attr('y1', 0).attr('y2', bh);
+  }
+  for (var lat = -45; lat <= 75; lat += 15) {
+    var y = P([0, lat])[1];
+    gGrid.append('line').attr('class', 'grid' + (lat === 0 ? ' major' : '')).attr('x1', 0).attr('x2', bw).attr('y1', y).attr('y2', y);
+  }
+  gRing = gWorld.append('g').attr('clip-path', 'url(#mapclip)');   // the far north and south are cropped
+  gWorld.append('rect').attr('class', 'edge').attr('width', bw).attr('height', bh);
+
+  svg.append('rect').attr('width', W).attr('height', H).attr('fill', 'url(#hex)').attr('pointer-events', 'none');
+  gTicks = svg.append('g');
+  gTicks.selectAll('.lon').data(d3.range(-150, 151, 30)).join('text').attr('class', 'tick lon').attr('text-anchor', 'middle')
+    .text(function (d) { return d === 0 ? '0°' : Math.abs(d) + '°' + (d < 0 ? 'W' : 'E'); });
+  gTicks.selectAll('.lat').data(d3.range(-45, 76, 15)).join('text').attr('class', 'tick lat').attr('text-anchor', 'end').attr('dominant-baseline', 'middle')
+    .text(function (d) { return d === 0 ? 'EQ' : Math.abs(d) + '°' + (d < 0 ? 'S' : 'N'); });
+  gCtr = svg.append('g');
+  gLaunch = svg.append('g');
+  svg.classed('placing', placing);
+
+  zoom = d3.zoom().scaleExtent([1, 12]).extent([[0, 0], [W, H]]).translateExtent(box).on('zoom', function (ev) { T = ev.transform; place(); });
+  // phone: touching the map tucks the sheet away so it never sits over what you are looking at
+  zoom.on('start', function (ev) { if (ev.sourceEvent && phone() && !$('#roster').classList.contains('closed')) setSheet(false); });
+  svg.call(zoom).on('dblclick.zoom', null);
+  svg.on('click', onMapClick);   // d3-zoom swallows the click that ends a drag, so panning never places
+  var cover = Math.max(W / bw, H / bh);
+  var k0 = phone() ? cover : Math.min(cover, 1.5);   // phone: fill the height and pan sideways
+  var c0 = P(phone() ? [60, 30] : [10, 13]);
+  svg.call(zoom.transform, clamp(d3.zoomIdentity.translate(W / 2, H / 2).scale(k0).translate(-c0[0], -c0[1])));
+  $('#zoom').hidden = false;
+  paint();
+}
+
+// zoom.transform does not keep the map inside its edges by itself (only drags do), so views we set go through this
+function clamp(t) { return zoom.constrain()(t, [[0, 0], [W, H]], box); }
+
+function place() {
+  gWorld.attr('transform', T);
+  hexPat.attr('patternTransform', 'translate(' + (T.x % 36) + ',' + (T.y % 20.78) + ')');
+  var bar = barH(), top = Math.max(T.applyY(0), bar) + 12, right = Math.min(T.applyX(box[1][0]), W) - 8;
+  var left = !phone() && mode ? PANEL : 0, bottom = H - (phone() ? sheetH() : 120);
+  gTicks.selectAll('.lon').attr('x', function (d) { return T.applyX(P([d, 0])[0]); }).attr('y', top)
+    .attr('visibility', function (d) { var x = T.applyX(P([d, 0])[0]); return x < left + 18 || x > W - 18 ? 'hidden' : 'visible'; });
+  gTicks.selectAll('.lat').attr('x', right).attr('y', function (d) { return T.applyY(P([0, d])[1]); })
+    .attr('visibility', function (d) { var y = T.applyY(P([0, d])[1]); return y < top + 14 || y > bottom ? 'hidden' : 'visible'; });
+  gCtr.selectAll('.ctr').attr('transform', function (d) { var p = T.apply(P(d.at)); return 'translate(' + p[0] + ',' + p[1] + ')'; });
+  gLaunch.selectAll('.lnch').attr('transform', function (d) { var p = T.apply(P(d.at)); return 'translate(' + p[0] + ',' + p[1] + ')'; });
+}
+
+function cls(sl) { return sl.s.role === 'defensive' ? 'def' : 'off'; }
+
+function ringData() {
+  return placed().filter(function (sl) { return sl.s.ring_km; }).map(function (sl) {
+    return { geo: d3.geoCircle().center(sl.at).radius(sl.s.ring_km / KM_PER_DEG)(), cls: cls(sl) };
+  });
+}
+
+// launcher label, e.g. "S-400 · 400 km" (the radius sits with the launcher so labels never collide)
+function lnLabel(sl) { return sl.s.name + (sl.s.ring_km ? ' · ' + sl.s.ring_km.toLocaleString('en-US') + ' km' : ''); }
+
+function shown() {
+  if (!mode) return [];
+  var all = DATA[mode].countries;
+  return selSys ? all.filter(function (c) { return c.iso === selIso; }) : all;
+}
+
+function paint() {
+  if (!lands) return;
+  var list = shown(), has = {};
+  list.forEach(function (c) { has[c.iso] = true; });
+  var held = {};   // countries of the systems on the map, outlined in their ring colour
+  ['Strike', 'Defence'].forEach(function (g) { if (slots[g]) held[slots[g].c.iso] = cls(slots[g]); });
+  lands.classed('has', function (d) { return !!has[d.id]; }).classed('sel', function (d) { return d.id === selIso; })
+    .classed('held-off', function (d) { return held[d.id] === 'off' && d.id !== selIso; })
+    .classed('held-def', function (d) { return held[d.id] === 'def' && d.id !== selIso; });
+  // once the chosen system's launcher is placed it replaces that country's counter, so the two never overlap
+  var hide = curLauncher() ? selIso : null;
+  var ctr = gCtr.selectAll('.ctr').data(list.filter(function (c) { return c.iso !== hide; }), function (d) { return d.iso; }).join(function (enter) {
+    var g = enter.append('g').attr('class', 'ctr').attr('role', 'button').attr('tabindex', 0)
+      .attr('aria-label', function (d) { return d.name + ', ' + d.systems.length + ' systems'; })
+      .on('click', function (ev, d) { if (!placing) pickCountry(d, false, true); })
+      .on('keydown', function (ev, d) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); pickCountry(d, false, true); } });
+    g.append('rect').attr('class', 'sh').attr('x', -16).attr('y', -9).attr('width', 36).attr('height', 22).attr('rx', 2);
+    g.append('rect').attr('class', 'face').attr('x', -19).attr('y', -12).attr('width', 36).attr('height', 22).attr('rx', 2);
+    g.append('text').attr('class', 'cd').attr('x', -1).attr('y', -1).text(function (d) { return d.code; });
+    g.append('circle').attr('class', 'bd').attr('cx', 17).attr('cy', -12).attr('r', 7.5);
+    g.append('text').attr('class', 'bn').attr('x', 17).attr('y', -12).text(function (d) { return d.systems.length; });
+    return g;
+  });
+  ctr.classed('on', function (d) { return d.iso === selIso; });
+  ctr.filter(function (d) { return d.iso === selIso; }).raise();
+  var rings = ringData();
+  gRing.selectAll('path').data(rings).join('path').attr('class', function (d) { return 'ring-' + d.cls; }).attr('d', function (d) { return path(d.geo); });
+  // generic launcher vehicle: chassis, cab, raised container, wheels; the dot marks the exact spot
+  var ln = gLaunch.selectAll('.lnch').data(placed(), function (d) { return grpOf(d.cat); }).join(function (enter) {
+    var g = enter.append('g');
+    g.append('circle').attr('class', 'ring').attr('r', 16);
+    var v = g.append('g').attr('transform', 'translate(-17,-25)');
+    v.append('rect').attr('class', 'tube').attr('x', 4).attr('y', 3).attr('width', 22).attr('height', 8).attr('rx', 1.5).attr('transform', 'rotate(-14 4 11)');
+    v.append('rect').attr('class', 'body').attr('x', 2).attr('y', 12).attr('width', 24).attr('height', 6).attr('rx', 1);
+    v.append('path').attr('class', 'body').attr('d', 'M26 18V10h5l3 4v4z');
+    [8, 16, 29].forEach(function (x) { v.append('circle').attr('class', 'wh').attr('cx', x).attr('cy', 20).attr('r', 3); });
+    g.append('circle').attr('class', 'pt').attr('r', 2.6);
+    g.append('text').attr('class', 'lname').attr('y', 18);
+    return g;
+  });
+  ln.attr('class', function (d) { return 'lnch ' + cls(d); });
+  ln.select('.lname').text(lnLabel);
+  place();
+}
+
+function sheetH() {
+  var r = $('#roster');
+  return r.hidden ? 0 : Math.max(0, H - r.getBoundingClientRect().top);
+}
+
+function flyTo(c) {
+  if (!svg) return;
+  var p = P(c.at), k = Math.max(T.k, phone() ? 2.2 : 2.5), bar = barH();
+  var cx = phone() ? W / 2 : PANEL + (W - PANEL) / 2;
+  var cy = phone() ? bar + (H - sheetH() - bar) / 2 : bar + (H - bar) / 2;
+  var t = clamp(d3.zoomIdentity.translate(cx, cy).scale(k).translate(-p[0], -p[1]));
+  (slow() ? svg : svg.transition().duration(750)).call(zoom.transform, t);
+}
+
+/* ---------- roster and weapon detail ---------- */
+function countryByIso(iso) {
+  if (!mode) return null;
+  return DATA[mode].countries.filter(function (c) { return c.iso === iso; })[0] || null;
+}
+
+function detail(c, s) {
+  var d = el('section', null, 'det');
+  var st = el('span', null, 'pill');
+  st.append(el('span', null, 'dot ' + statusClass(s.status)), document.createTextNode(s.status));
+  var dl = el('dl', null, 'stats');
+  var rows = [['Range', s.range], ['Speed', s.speed]], launcher = curLauncher();
+  if (launcher) {
+    rows.push(['Launcher', fmtLL(launcher)]);
+    rows.push(['Ring', s.ring_km ? s.ring_km.toLocaleString('en-US') + ' km radius. ' + s.ring_note + '.'
+                                 : 'No published range, so no ring is drawn.']);
+  }
+  rows.forEach(function (r) {
+    var row = el('div', null, 'stat'); row.append(el('dt', r[0]), el('dd', r[1])); dl.append(row);
+  });
+  var cta = $('#launch').cloneNode(true);   // same icon and label as the top-bar button
+  cta.removeAttribute('id'); cta.hidden = false;
+  cta.onclick = function () { setPlacing(!placing); };
+  var key = null;
+  if (launcher && s.ring_km) {
+    key = el('p', null, 'dnote');
+    var off = s.role !== 'defensive';
+    key.append(el('span', null, 'key ' + (off ? 'off' : 'def')),
+               document.createTextNode((off ? 'Red ring: offensive system.' : 'Blue ring: defensive system.') + ' Shows the distance from the launcher, not a flight path.'));
+  }
+  var a = el('a', 'Read on Wikipedia ↗', 'il');
+  a.href = 'https://en.wikipedia.org/wiki/Special:Search?go=Go&search=' + encodeURIComponent(s.wiki);
+  a.target = '_blank'; a.rel = 'noopener';
+  d.append(el('p', s.name, 'dn'), el('p', c.name + ' · ' + s.kind, 'dk'), st, el('p', s.desc, 'dd'), dl, cta);
+  if (key) d.append(key);
+  d.append(el('p', 'Approximate public figures. Claims are not independently verified.', 'dnote'), a);
+  return d;
+}
+
+function renderRoster() {
+  var m = DATA[mode], n = 0;
+  m.countries.forEach(function (c) { n += c.systems.length; });
+  $('#rt').textContent = mode;
+  $('#rc').textContent = selSys ? 'Tap ' + selSys.name + ' again to see all countries'
+                                : m.countries.length + ' countries · ' + n + ' systems';
+  if (phone() && selSys) {
+    // the phone sheet's strip is often all that is visible, so it says what is on the map
+    var launcher = curLauncher();
+    $('#rt').textContent = selSys.name;
+    $('#rc').textContent = !launcher ? 'Tap here for details'
+      : selSys.ring_km ? selSys.ring_km.toLocaleString('en-US') + ' km ring · tap for details'
+      : 'Launcher placed · tap for details';
+  }
+  var list = $('#rl'); list.replaceChildren();
+  shown().forEach(function (c) {
+    var sec = el('section', null, 'nation' + (c.iso === selIso ? ' on' : ''));
+    sec.id = 'n-' + c.iso;
+    var hd = el('button', null, 'nn'); hd.type = 'button';
+    hd.append(el('span', c.code, 'tok'), el('span', c.name, 'cn'), el('span', c.systems.length + (c.systems.length === 1 ? ' system' : ' systems'), 'cnt'));
+    hd.onclick = function () { pickCountry(c, true, false); };
+    var row = el('div', null, 'wrow');
+    c.systems.forEach(function (s) {
+      var b = el('button', null, 'wb'); b.type = 'button';
+      b.setAttribute('aria-pressed', String(s === selSys));
+      b.append(el('span', null, 'dot ' + statusClass(s.status)), document.createTextNode(s.name));
+      b.title = s === selSys ? 'Tap again to close' : s.status;
+      b.onclick = function () { pickSystem(c, s); };
+      row.append(b);
+    });
+    sec.append(hd, row);
+    if (selSys && c.iso === selIso) sec.append(detail(c, selSys));
+    list.append(sec);
+  });
+  var lg = $('#legend'); lg.replaceChildren();
+  lg.hidden = !!selSys;
+  STATUS.forEach(function (s) { var i = el('span'); i.append(el('span', null, 'dot ' + s[1]), document.createTextNode(s[0])); lg.append(i); });
+  renderChips();
+  updateLaunch();
+  syncBar();   // the launcher button can wrap the bar onto another line on narrow screens
+}
+
+function setSheet(open) {
+  $('#roster').classList.toggle('closed', !open);
+  $('#rh').setAttribute('aria-expanded', String(open));
+}
+
+/* ---------- launcher placement ---------- */
+function fmtLL(ll) {
+  return Math.abs(ll[1]).toFixed(1) + '°' + (ll[1] < 0 ? 'S' : 'N') + ', ' + Math.abs(ll[0]).toFixed(1) + '°' + (ll[0] < 0 ? 'W' : 'E');
+}
+
+var toastTimer;
+function toast(text, err) {
+  var t = $('#toast');
+  t.textContent = text; t.className = 'toast' + (err ? ' err' : ''); t.hidden = false;
+  clearTimeout(toastTimer);
+  if (!placing || err) toastTimer = setTimeout(function () { t.hidden = true; }, err ? 3500 : 2500);
+}
+
+// keeps the top-bar button, the one in the weapon details and the phone sheet's button in step
+function updateLaunch() {
+  var launcher = curLauncher();
+  $('#launch').hidden = !selSys;
+  var pk = $('#peekact');
+  pk.hidden = !selSys || placing;
+  pk.textContent = launcher ? 'Move' : 'Place launcher';
+  pk.classList.toggle('moved', !!launcher);
+  document.querySelectorAll('.launch').forEach(function (b) {
+    b.setAttribute('aria-pressed', String(placing));
+    b.classList.toggle('nudge', !placing && !launcher);
+    b.classList.toggle('moved', !placing && !!launcher);
+    b.querySelector('.lt').textContent = placing ? 'Cancel' : launcher ? 'Move Launcher' : 'Select Launcher Position';
+  });
+}
+
+var placeTimer;
+function placeMsg(text, err) {
+  $('#placemsg').textContent = text;
+  $('#placebar').classList.toggle('err', !!err);
+}
+function placeHint() {
+  var g = grpOf(mode), other = slots[g] && slots[g].s !== selSys ? slots[g].s.name : null;
+  placeMsg('Tap inside ' + countryByIso(selIso).name + ' to place the ' + selSys.name + ' launcher.' +
+           (other ? ' It replaces ' + other + ' on the map.' : ' Pinch or drag to move the map.'));
+}
+
+// Placing mode: on phone everything but the map and the placing strip is hidden.
+function setPlacing(on) {
+  placing = on;
+  if (svg) svg.classed('placing', on);
+  document.body.classList.toggle('placing', on);
+  clearTimeout(placeTimer);
+  $('#placebar').hidden = !on;
+  $('#toast').hidden = true;
+  if (on) { placeHint(); if (phone()) setSheet(false); }
+  updateLaunch();
+}
+
+/* ---------- what is on the map: chips in the header ---------- */
+// One chip per system on the map (red strike, blue defence). Tap it to see the system again; ✕ removes it.
+function renderChips() {
+  var box = $('#chips'); box.replaceChildren();
+  ['Strike', 'Defence'].forEach(function (g) {
+    var sl = slots[g];
+    if (!sl) return;
+    var chip = el('span', null, 'chip ' + cls(sl) + (sl.s === selSys ? ' cur' : ''));
+    var show = el('button', null, 'cs'); show.type = 'button';
+    show.append(el('span', null, 'cdot'), document.createTextNode(sl.s.name));
+    show.title = 'Show ' + sl.s.name;
+    show.onclick = function () { showSlot(g); };
+    var x = el('button', '✕', 'cx'); x.type = 'button';
+    x.setAttribute('aria-label', 'Remove ' + sl.s.name + ' from the map');
+    x.onclick = function () { removeSlot(g); };
+    chip.append(show, x); box.append(chip);
+  });
+  box.hidden = !box.childElementCount;
+  syncBar();
+}
+
+function showSlot(g) {
+  var sl = slots[g];
+  if (placing) setPlacing(false);
+  if (mode !== sl.cat) {
+    mode = sl.cat;
+    $('#pickt').textContent = DATA[mode].short;
+    $('#pick').classList.add('set');
+    $('#roster').hidden = false;
+  }
+  selIso = sl.c.iso; selSys = sl.s;
+  renderRoster(); paint();
+  $('#rl').scrollTop = 0;
+  if (phone()) setSheet(true);
+  flyTo(sl.c);
+}
+
+function removeSlot(g) {
+  var sl = slots[g];
+  slots[g] = null;
+  if (placing && selSys === sl.s) setPlacing(false);
+  renderRoster(); paint();
+}
+
+function onMapClick(ev) {
+  if (!placing || !selSys) return;
+  var c = countryByIso(selIso), pt = d3.pointer(ev, svg.node());
+  var m = T.invert(pt), ll = proj.invert([m[0], m[1] / sy]);
+  var f = features.filter(function (x) { return x.id === selIso; })[0];
+  if (!ll || !f || !d3.geoContains(f, ll)) {
+    placeMsg('That’s not within ' + c.name + '. Tap inside ' + c.name + '.', true);
+    clearTimeout(placeTimer);
+    placeTimer = setTimeout(function () { if (placing) placeHint(); }, 3000);
+    return;
+  }
+  var g = grpOf(mode);
+  if (!slots[g] || slots[g].s !== selSys) slots[g] = { cat: mode, c: c, s: selSys, at: null };
+  slots[g].at = ll;
+  setPlacing(false);
+  renderRoster(); paint();
+  toast(selSys.name + ' launcher placed in ' + c.name + ' at ' + fmtLL(ll) + '.');
+}
+
+function pickCountry(c, fly, fromMap) {
+  if (placing) setPlacing(false);
+  if (selIso !== c.iso) selSys = null;
+  selIso = c.iso;
+  renderRoster(); paint();
+  if (fly) flyTo(c);
+  if (fromMap && phone()) setSheet(true);
+  var row = document.getElementById('n-' + c.iso);
+  if (row && (fromMap || !phone())) row.scrollIntoView({ block: 'nearest', behavior: slow() ? 'auto' : 'smooth' });
+}
+
+// Choosing a system hides the other countries and shows its details; choosing it again brings them back.
+// Browsing never changes the map: a system only goes on the map (replacing the previous strike or
+// defence system) when its launcher is placed.
+function pickSystem(c, s) {
+  if (placing) setPlacing(false);
+  if (selSys === s) {
+    selSys = null;
+    renderRoster(); paint();
+    var row = document.getElementById('n-' + c.iso);
+    if (row) row.scrollIntoView({ block: 'nearest' });
+    return;
+  }
+  selIso = c.iso; selSys = s;
+  renderRoster(); paint();
+  $('#rl').scrollTop = 0;
+  if (phone()) setSheet(true);
+  flyTo(c);
+}
+
+function setMode(m) {
+  if (placing) setPlacing(false);
+  mode = m; selIso = null; selSys = null;   // systems already on the map stay there
+  $('#pickt').textContent = DATA[m].short;
+  $('#pick').classList.add('set');
+  $('#roster').hidden = false;
+  setSheet(true);
+  renderRoster(); paint();
+  if (features) $('#msg').hidden = true;
+}
+
+/* ---------- weapon picker ---------- */
+// small icons: a strike arc (red) or a defensive dome (blue)
+var ICONS = {
+  Strike: [['path', { d: 'M6 30 C14 12 24 8 34 6', fill: 'none', stroke: '#f06050', 'stroke-width': '2', 'stroke-dasharray': '3 3', 'stroke-linecap': 'round' }],
+           ['circle', { cx: '34', cy: '6', r: '3.5', fill: '#f06050' }],
+           ['rect', { x: '3', y: '30', width: '10', height: '6', rx: '1', fill: '#cbbd92', stroke: '#000', 'stroke-width': '1' }]],
+  Defence: [['path', { d: 'M5 32 A15 15 0 0 1 35 32', fill: 'rgb(80 140 240 / .2)', stroke: '#78aaff', 'stroke-width': '2', 'stroke-dasharray': '3 3' }],
+            ['rect', { x: '15', y: '27', width: '10', height: '6', rx: '1', fill: '#cbbd92', stroke: '#000', 'stroke-width': '1' }]]
+};
+
+function openPicker() {
+  var box = $('#opts'); box.replaceChildren();
+  ['Strike', 'Defence'].forEach(function (grp) {
+    box.append(el('p', grp === 'Strike' ? 'Strike · red rings' : 'Defence · blue rings', 'grp ' + (grp === 'Strike' ? 'off' : 'def')));
+    Object.keys(DATA).filter(function (k) { return DATA[k].group === grp; }).forEach(function (k) {
+      var b = el('button', null, 'opt'); b.type = 'button';
+      b.setAttribute('aria-pressed', String(k === mode));
+      var ns = 'http://www.w3.org/2000/svg', g = document.createElementNS(ns, 'svg');
+      g.setAttribute('viewBox', '0 0 40 40'); g.setAttribute('aria-hidden', 'true');
+      ICONS[grp].forEach(function (s) {
+        var n = document.createElementNS(ns, s[0]); Object.keys(s[1]).forEach(function (a) { n.setAttribute(a, s[1][a]); }); g.append(n);
+      });
+      b.append(g, el('span', k, 'on1'), el('span', DATA[k].blurb, 'on2'));
+      b.onclick = function () { $('#dlg').close(); setMode(k); };
+      box.append(b);
+    });
+  });
+  $('#dlg').showModal();
+}
+$('#pick').onclick = openPicker;
+$('#dlg').addEventListener('click', function (e) { if (e.target === this) this.close(); });
+$('#rh').onclick = function () {
+  if (!phone()) return;
+  var open = $('#roster').classList.contains('closed');
+  setSheet(open);
+  var row = selIso && document.getElementById('n-' + selIso);
+  if (open && row) row.scrollIntoView({ block: 'nearest' });
+};
+$('#zin').onclick = function () { svg && svg.transition().duration(250).call(zoom.scaleBy, 1.6); };
+$('#zout').onclick = function () { svg && svg.transition().duration(250).call(zoom.scaleBy, 1 / 1.6); };
+$('#zfit').onclick = function () { svg && svg.transition().duration(400).call(zoom.transform, clamp(d3.zoomIdentity)); };
+document.addEventListener('keydown', function (e) {
+  if (e.key !== 'Escape' || $('#dlg').open) return;
+  if (placing) setPlacing(false);
+  else if (selSys) { selSys = null; renderRoster(); paint(); }
+});
+$('#launch').onclick = function () { setPlacing(!placing); };
+$('#peekact').onclick = function () { setPlacing(true); };
+$('#placecancel').onclick = function () { setPlacing(false); };
+
+/* ---------- start ---------- */
+function showMsg(text, err) { var m = $('#msg'); m.hidden = false; m.className = 'msg' + (err ? ' err' : ''); m.firstElementChild.textContent = text; }
+function syncBar() { document.documentElement.style.setProperty('--barh', (barH() + 4) + 'px'); }
+syncBar();
+if (!window.d3 || !window.topojson) {
+  showMsg('Could not load the map tools. Check your connection and reload the page.', true);
+} else {
+  d3.json(WORLD_URL).then(function (world) {
+    features = topojson.feature(world, world.objects.countries).features.filter(function (f) { return f.properties.name !== 'Antarctica'; });
+    syncBar(); build();
+    if (mode) $('#msg').hidden = true; else showMsg('Tap “Choose your Weapon” to begin.');
+    // Rebuild when the window changes size (rotation, resizing). Small height changes from the
+    // phone's address bar sliding are ignored so the map does not jump while you pan.
+    var timer;
+    new ResizeObserver(function () {
+      clearTimeout(timer);
+      timer = setTimeout(function () {
+        syncBar();
+        var host = $('#map');
+        if (Math.abs(host.clientWidth - W) > 1 || Math.abs(host.clientHeight - H) > 120) build(); else place();
+      }, 150);
+    }).observe($('#map'));
+  }).catch(function () { showMsg('Could not load the world map. Check your connection and reload the page.', true); });
+}
+</script>
+</body></html>"""
+BATTLE_HTML = BATTLE_PAGE.replace("__BATTLE_DATA__", json.dumps(BATTLE_LAB).replace("</", "<\\/"))
+
+
+HOME = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Guided Weapons University</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Jost:wght@500;700&family=Zilla+Slab:ital,wght@0,400;0,600;1,400&display=swap">
+<style>
+/* Layout: full-window "game select" screen in the Battle Lab command-map style.
+   Crest and welcome at the top; Battle Lab is a wide featured banner; the other three apps sit in one row below.
+   Phone: everything stacks in one column. */
+:root{
+  color-scheme:dark;
+  --bg:#0d1216;
+  --ink:#d9e2d6;
+  --muted:#8e9c93;
+  --line:#34434b;
+  --panel:#151e25;
+  --accent:#e3b34a;
+  --accent-ink:#1c1505;
+  --display:"Jost","Futura","Century Gothic","Avenir Next",system-ui,sans-serif;
+  --body:"Zilla Slab","Archer","Rockwell",Georgia,serif;
+}
+[hidden]{display:none!important}
+html,body{min-height:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--body);overflow-x:hidden}
+:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+
+/* background: faint map grid, warm glow, dark edges */
+.bg{position:fixed;inset:0;z-index:0;pointer-events:none;background:
+  radial-gradient(ellipse at 50% 45%,transparent 45%,rgb(0 0 0 / .6)),
+  radial-gradient(50% 40% at 85% 0%,rgb(227 179 74 / .09),transparent 70%),
+  linear-gradient(rgb(150 185 150 / .06) 1px,transparent 1px) 0 0 / 64px 64px,
+  linear-gradient(90deg,rgb(150 185 150 / .06) 1px,transparent 1px) 0 0 / 64px 64px,
+  var(--bg)}
+
+/* on a PC the whole menu fits the window: header, apps (taking the rest), footer */
+.wrap{position:relative;z-index:1;min-height:100vh;min-height:100dvh;box-sizing:border-box;display:grid;grid-template-rows:auto minmax(0,1fr) auto;
+  gap:clamp(14px,2.4vh,26px);padding:clamp(14px,2.2vw,28px) clamp(16px,3vw,48px) clamp(12px,1.6vh,18px)}
+
+/* header: crest with the welcome beside it */
+.top{display:flex;align-items:center;gap:clamp(14px,1.8vw,24px)}
+.crest{flex:none;width:clamp(64px,6.4vw,96px);height:auto;filter:drop-shadow(0 6px 12px rgb(0 0 0 / .5))}
+.crest text{font-family:var(--display);font-weight:700}
+.welcome{min-width:0}
+.inst{margin:0 0 4px;font-family:var(--display);font-weight:500;font-size:.76rem;letter-spacing:.22em;text-transform:uppercase;color:var(--muted)}
+.inst b{font-weight:700;color:var(--accent);letter-spacing:.26em}
+.welcome h1{margin:0;font-family:var(--display);font-weight:700;font-size:clamp(1.4rem,3.1vw,2.6rem);letter-spacing:.07em;text-transform:uppercase;line-height:1.1;
+  text-shadow:3px 3px 0 rgb(227 179 74 / .4);text-wrap:balance}
+.lede{margin:8px 0 0;max-width:52rem;color:var(--muted);font-size:clamp(.95rem,1.2vw,1.08rem);line-height:1.45}
+
+/* app grid: Battle Lab across the top, three apps below */
+.apps{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:minmax(210px,1.25fr) minmax(200px,1fr);gap:clamp(14px,1.6vw,22px);min-height:0}
+
+.card{position:relative;display:flex;flex-direction:column;justify-content:flex-end;min-width:0;overflow:hidden;box-sizing:border-box;padding:clamp(16px,2vw,26px);
+  border-radius:16px;border:1px solid var(--line);background:linear-gradient(160deg,#1b2630,#11181e);color:inherit;text-decoration:none;
+  box-shadow:0 14px 30px rgb(0 0 0 / .45);transition:transform .18s ease-out,border-color .18s,box-shadow .18s}
+.card:hover,.card:focus-visible{transform:translateY(-4px);border-color:var(--accent);
+  box-shadow:0 0 0 1px var(--accent),0 22px 40px rgb(0 0 0 / .55),0 0 36px rgb(227 179 74 / .16)}
+.card:active{transform:translateY(-1px)}
+.art{position:absolute;inset:0;z-index:0;width:100%;height:100%}
+.txt{position:relative;z-index:1;display:grid;justify-items:start;gap:6px}
+.tag{padding:3px 10px;border-radius:999px;border:1px solid var(--accent);background:rgb(13 18 22 / .7);color:var(--accent);
+  font-family:var(--display);font-weight:700;font-size:.64rem;letter-spacing:.22em;text-transform:uppercase}
+.name{margin:4px 0 0;font-family:var(--display);font-weight:700;font-size:clamp(1.1rem,1.7vw,1.45rem);letter-spacing:.16em;text-transform:uppercase;line-height:1.15}
+.desc{margin:0;max-width:34rem;color:var(--muted);font-size:.98rem;line-height:1.45}
+.go{display:inline-flex;align-items:center;gap:8px;margin-top:8px;padding:7px 16px;border-radius:999px;border:1.5px solid var(--accent);color:var(--accent);
+  font-family:var(--display);font-weight:700;font-size:.74rem;letter-spacing:.18em;text-transform:uppercase}
+.go svg{width:11px;height:11px;fill:currentColor}
+.card:hover .go,.card:focus-visible .go{background:var(--accent);color:var(--accent-ink)}
+
+/* the featured Battle Lab banner */
+.hero{grid-column:1 / -1}
+.hero .art-fade{position:absolute;inset:0;z-index:0;background:linear-gradient(90deg,rgb(13 18 22 / .92) 0%,rgb(13 18 22 / .6) 38%,transparent 70%),
+  linear-gradient(0deg,rgb(13 18 22 / .7),transparent 45%)}
+.hero .name{font-size:clamp(1.9rem,4.4vw,3.4rem);letter-spacing:.2em;text-shadow:3px 3px 0 rgb(0 0 0 / .6)}
+.hero .desc{color:#b9c4bb;font-size:1.05rem}
+.hero .go{padding:10px 22px;font-size:.85rem;background:var(--accent);color:var(--accent-ink);box-shadow:0 3px 0 #000}
+.hero:hover .go{filter:brightness(1.1)}
+
+/* the three smaller apps: icon beside the text, both resting on the bottom edge, so they never overlap */
+.small{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:end;gap:clamp(12px,1.4vw,18px)}
+.icon{position:relative;z-index:1;align-self:start;width:clamp(40px,3.8vw,58px);height:auto}
+.small .desc{font-size:.93rem}
+.small::before{content:"";position:absolute;inset:0;z-index:0;background:radial-gradient(70% 60% at 90% 0%,rgb(227 179 74 / .07),transparent 70%)}
+
+.foot{margin:0;color:var(--muted);font-size:.82rem;text-align:center}
+
+/* PC: lock the menu to the window so the apps share exactly the space left under the header */
+@media (min-width:721px) and (min-height:620px){
+  .wrap{height:100vh;height:100dvh}
+}
+@media (max-width:720px){
+  .top{align-items:flex-start}
+  .apps{grid-template-columns:1fr;grid-template-rows:none}
+  .hero{min-height:300px}
+  .small{min-height:170px}
+}
+@media (prefers-reduced-motion:reduce){.card{transition:none}.card:hover,.card:focus-visible{transform:none}}
+</style>
+</head><body>
+<div class="bg" aria-hidden="true"></div>
+<div class="wrap">
+  <header class="top">
+    <!-- school-style crest: shield, trajectory arc over an open book, ASPC-GW banner; welcome text beside it -->
+    <svg class="crest" viewBox="0 0 120 140" role="img" aria-label="ASPC-GW crest">
+      <path d="M60 4 112 17v47c0 37-24 61-52 72C32 125 8 101 8 64V17z" fill="#18222a" stroke="#e3b34a" stroke-width="4" stroke-linejoin="round"/>
+      <path d="M60 12 104 23v41c0 31-20 52-44 62-24-10-44-31-44-62V23z" fill="none" stroke="#e3b34a" stroke-width="1" opacity=".45"/>
+      <path d="M26 62Q52 20 92 36" fill="none" stroke="#e3b34a" stroke-width="2.4" stroke-dasharray="4 4" stroke-linecap="round"/>
+      <path d="M92 29l2.2 4.6 5 .7-3.6 3.5.9 5-4.5-2.4-4.5 2.4.9-5-3.6-3.5 5-.7z" fill="#e3b34a"/>
+      <rect x="10" y="66" width="100" height="24" rx="3" fill="#e3b34a"/>
+      <text x="60" y="83.5" text-anchor="middle" font-size="15.5" letter-spacing="1.2" fill="#1c1505">ASPC-GW</text>
+      <path d="M60 104c-8-5-18-6-26-4v18c8-2 18-1 26 4 8-5 18-6 26-4v-18c-8-2-18-1-26 4zM60 104v18" fill="none" stroke="#cbbd92" stroke-width="2" stroke-linejoin="round"/>
+    </svg>
+    <div class="welcome">
+      <p class="inst"><b>ASPC-GW</b> · Guided Weapons University</p>
+      <h1>Welcome to the Guided Weapons University</h1>
+      <p class="lede">An academic space for our engineers to explore, learn and experiment with public information on guided weapons. Choose an app to begin.</p>
     </div>
-  </main>
+  </header>
+
+  <nav class="apps" aria-label="Apps">
+    <a class="card hero" href="/battle-lab">
+      <!-- illustration: map grid, hexes, two abstract landmasses, a red and a blue ring with launcher tokens -->
+      <svg class="art" viewBox="0 0 1200 500" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+        <defs>
+          <pattern id="hx" width="36" height="20.78" patternUnits="userSpaceOnUse">
+            <path d="M0,10.39 L6,0 L18,0 L24,10.39 L18,20.78 L6,20.78 Z M24,10.39 L36,10.39" fill="none" stroke="rgb(160 200 160 / .09)"/>
+          </pattern>
+          <pattern id="gr" width="80" height="80" patternUnits="userSpaceOnUse">
+            <path d="M80 0H0V80" fill="none" stroke="rgb(150 185 150 / .16)"/>
+          </pattern>
+        </defs>
+        <rect width="1200" height="500" fill="#142029"/>
+        <path d="M520 70c80-30 190-20 260 20s150 10 220 40 140 90 120 160-110 70-170 60-90 60-160 50-100-70-170-80-140 10-150-60 0-160 50-190z" fill="#2e3829" stroke="#5f6d55" stroke-width="2"/>
+        <path d="M640 380c40-20 100-10 130 20s10 70-40 80-110-10-120-40 0-50 30-60z" fill="#2e3829" stroke="#5f6d55" stroke-width="2"/>
+        <rect width="1200" height="500" fill="url(#gr)"/>
+        <rect width="1200" height="500" fill="url(#hx)"/>
+        <line x1="0" y1="320" x2="1200" y2="320" stroke="rgb(227 179 74 / .4)" stroke-dasharray="10 8"/>
+        <circle cx="820" cy="210" r="165" fill="rgb(224 72 60 / .14)" stroke="rgb(240 96 80 / .85)" stroke-width="2.5" stroke-dasharray="12 8"/>
+        <circle cx="1010" cy="290" r="95" fill="rgb(80 140 240 / .14)" stroke="rgb(120 170 255 / .85)" stroke-width="2.5" stroke-dasharray="12 8"/>
+        <g transform="translate(803 196)"><rect x="0" y="6" width="30" height="8" rx="1.5" fill="#cbbd92" stroke="#000" stroke-width="1.5"/><rect x="2" y="-4" width="24" height="8" rx="1.5" fill="#9a8d63" stroke="#000" stroke-width="1.5" transform="rotate(-14 2 4)"/><circle cx="17" cy="23" r="3.5" fill="#f06050"/></g>
+        <g transform="translate(995 278)"><rect x="0" y="6" width="30" height="8" rx="1.5" fill="#cbbd92" stroke="#000" stroke-width="1.5"/><path d="M4 6a11 11 0 0 1 22 0" fill="#9a8d63" stroke="#000" stroke-width="1.5"/><circle cx="15" cy="23" r="3.5" fill="#78aaff"/></g>
+      </svg>
+      <span class="art-fade" aria-hidden="true"></span>
+      <span class="txt">
+        <span class="tag">Featured · Main app</span>
+        <span class="name">Battle Lab</span>
+        <span class="desc">Choose strike and defence systems, place their launchers on a world map and compare their published reach.</span>
+        <span class="go">Play <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 1l9 5-9 5z"/></svg></span>
+      </span>
+    </a>
+
+    <a class="card small" href="/trends">
+      <svg class="icon" viewBox="0 0 64 64" aria-hidden="true">
+        <rect x="7" y="40" width="10" height="18" rx="2" fill="#4a5a3c" stroke="#cbbd92" stroke-width="2"/>
+        <rect x="22" y="30" width="10" height="28" rx="2" fill="#4a5a3c" stroke="#cbbd92" stroke-width="2"/>
+        <rect x="37" y="20" width="10" height="38" rx="2" fill="#4a5a3c" stroke="#cbbd92" stroke-width="2"/>
+        <polyline points="8,30 23,21 38,25 55,8" fill="none" stroke="#e3b34a" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="55" cy="8" r="4.5" fill="#e3b34a"/>
+      </svg>
+      <span class="txt">
+        <span class="tag">Daily</span>
+        <span class="name">Top 10 News</span>
+        <span class="desc">The day's top stories on guided weapons, with short expert summaries and trend tracking.</span>
+        <span class="go">Enter <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 1l9 5-9 5z"/></svg></span>
+      </span>
+    </a>
+
+    <a class="card small" href="/research">
+      <svg class="icon" viewBox="0 0 64 64" aria-hidden="true">
+        <circle cx="26" cy="26" r="16" fill="#1f2a32" stroke="#cbbd92" stroke-width="2.4"/>
+        <path d="M17 24a10 10 0 0 1 9-9" fill="none" stroke="#e3b34a" stroke-width="3" stroke-linecap="round"/>
+        <line x1="38" y1="38" x2="56" y2="56" stroke="#cbbd92" stroke-width="6" stroke-linecap="round"/>
+        <circle cx="26" cy="26" r="4" fill="#e3b34a"/>
+      </svg>
+      <span class="txt">
+        <span class="tag">Tool</span>
+        <span class="name">Market Research</span>
+        <span class="desc">Find the published systems closest to your technical parameters.</span>
+        <span class="go">Enter <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 1l9 5-9 5z"/></svg></span>
+      </span>
+    </a>
+
+    <a class="card small" href="/standards">
+      <svg class="icon" viewBox="0 0 64 64" aria-hidden="true">
+        <rect x="8" y="12" width="14" height="44" rx="2" fill="#1f2a32" stroke="#cbbd92" stroke-width="2.2"/>
+        <rect x="25" y="8" width="14" height="48" rx="2" fill="#4a5a3c" stroke="#cbbd92" stroke-width="2.2"/>
+        <rect x="42" y="16" width="14" height="40" rx="2" fill="#1f2a32" stroke="#cbbd92" stroke-width="2.2" transform="rotate(8 49 36)"/>
+        <line x1="11" y1="22" x2="19" y2="22" stroke="#e3b34a" stroke-width="2.4" stroke-linecap="round"/>
+        <line x1="28" y1="18" x2="36" y2="18" stroke="#e3b34a" stroke-width="2.4" stroke-linecap="round"/>
+      </svg>
+      <span class="txt">
+        <span class="tag">Reference</span>
+        <span class="name">Standards Library</span>
+        <span class="desc">Free military and space standards, with team notes.</span>
+        <span class="go">Enter <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 1l9 5-9 5z"/></svg></span>
+      </span>
+    </a>
+  </nav>
+
+  <p class="foot">For learning and discussion. Built from public information only.</p>
 </div>
 </body></html>"""
 
@@ -3996,12 +4816,6 @@ def trends():
     return PAGE
 
 
-@app.route("/contracts")
-def contracts():
-    kick_awards()
-    return CONTRACTS_PAGE
-
-
 @app.route("/research")
 def research():
     request_types(list(RESEARCH_TYPES), front=False)  # start loading data in the background
@@ -4011,6 +4825,11 @@ def research():
 @app.route("/standards")
 def standards():
     return STANDARDS_PAGE
+
+
+@app.route("/battle-lab")
+def battle_lab():
+    return BATTLE_HTML
 
 
 if __name__ == "__main__":
