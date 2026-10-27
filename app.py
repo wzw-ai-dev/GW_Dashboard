@@ -1621,8 +1621,9 @@ STD_SOURCES = {
     "NASA": {"name": "NASA Technical Standards", "url": "https://standards.nasa.gov/",
              "how": "Search the number on the NASA Technical Standards site. Free download."},
 }
-STD_AREAS = ["Environment & test", "EMC / E3", "Munition & fuze safety", "Interfaces & power",
-             "Reliability & safety", "Parts & workmanship", "Structures", "Marking & data", "Modelling & simulation"]
+STD_AREAS = ["Acquisition & systems engineering", "Environment & test", "EMC / E3", "Interfaces & power",
+             "Reliability & safety", "Parts & workmanship", "Structures", "Logistics & support", "Marking & data",
+             "Modelling & simulation", "Munition & fuze safety"]
 
 # number, source, kind, area, title, what it is for, status note ("" if none)
 _STD = [
@@ -1646,13 +1647,13 @@ _STD = [
      "Insensitive-munition and hazard tests: fast and slow cook-off, bullet and fragment impact, sympathetic reaction, drop.", ""),
     ("MIL-STD-1751", "DoD", "Test method", "Munition & fuze safety",
      "Safety and Performance Tests for the Qualification of Explosives",
-     "Tests used to qualify a new explosive (sensitivity, thermal stability, compatibility) before it goes into a munition.", ""),
+     "Tests used to qualify a new explosive (sensitivity, thermal stability, compatibility) before it goes into a munition.", "Cancelled; check which document replaced it on ASSIST."),
     ("MIL-HDBK-1512", "DoD", "Handbook", "Munition & fuze safety",
      "Electroexplosive Subsystems, Electrically Initiated, Design Requirements and Test Methods",
      "Design and test guidance for electrically initiated explosive subsystems such as squibs, initiators and firing circuits.", ""),
     ("MIL-STD-1576", "DoD", "Standard", "Munition & fuze safety",
      "Electroexplosive Subsystem Safety Requirements and Test Methods for Space Systems",
-     "Safety requirements and tests for electroexplosive subsystems on launch vehicles and spacecraft.", ""),
+     "Safety requirements and tests for electroexplosive subsystems on launch vehicles and spacecraft.", "Cancelled; check which document replaced it on ASSIST."),
     ("MIL-STD-461", "DoD", "Standard", "EMC / E3",
      "Requirements for the Control of Electromagnetic Interference Characteristics of Subsystems and Equipment",
      "Conducted and radiated emission and susceptibility limits and test methods (CE, CS, RE, RS) for equipment.", ""),
@@ -1703,7 +1704,7 @@ _STD = [
      "Screening and qualification tests for microcircuits: burn-in, temperature cycling, hermeticity, die shear and more.", ""),
     ("MIL-HDBK-263", "DoD", "Handbook", "Parts & workmanship",
      "Electrostatic Discharge Control Handbook",
-     "Guidance on ESD-sensitive items and how to protect them in design, handling and packaging.", ""),
+     "Guidance on ESD-sensitive items and how to protect them in design, handling and packaging.", "Cancelled, but still widely used as a reference."),
     ("MIL-HDBK-1823", "DoD", "Handbook", "Parts & workmanship",
      "Nondestructive Evaluation System Reliability Assessment",
      "How to measure probability of detection (POD) for NDE methods used on structures and parts.", ""),
@@ -1722,6 +1723,54 @@ _STD = [
     ("MIL-STD-3022", "DoD", "Standard", "Modelling & simulation",
      "Documentation of Verification, Validation, and Accreditation (VV&A) for Models and Simulations",
      "Templates for documenting VV&A of models and simulations, useful for flight and seeker simulations.", ""),
+    ("MIL-STD-881", "DoD", "Standard", "Acquisition & systems engineering",
+     "Work Breakdown Structures for Defense Materiel Items",
+     "How to build a programme's work breakdown structure, with standard templates by system type; the basis for cost, schedule and contract reporting.", ""),
+    ("MIL-STD-961", "DoD", "Standard", "Acquisition & systems engineering",
+     "Defense and Program-Unique Specifications Format and Content",
+     "How to write and lay out a specification: section structure, requirement wording and the verification section.", ""),
+    ("MIL-STD-962", "DoD", "Standard", "Acquisition & systems engineering",
+     "Defense Standards Format and Content",
+     "Format and content rules for preparing defense standards and handbooks.", ""),
+    ("MIL-HDBK-61", "DoD", "Handbook", "Acquisition & systems engineering",
+     "Configuration Management Guidance",
+     "Configuration identification, change control, status accounting and audits across the life cycle.", ""),
+    ("MIL-HDBK-516", "DoD", "Handbook", "Acquisition & systems engineering",
+     "Airworthiness Certification Criteria",
+     "The criteria used to show an air system, including stores it carries or releases, is airworthy.", ""),
+    ("MIL-HDBK-520", "DoD", "Handbook", "Acquisition & systems engineering",
+     "Systems Requirements Document Guidance",
+     "How to turn user needs into a well-formed systems requirements document.", ""),
+    ("MIL-STD-46855", "DoD", "Standard", "Reliability & safety",
+     "Human Engineering Requirements for Military Systems, Equipment, and Facilities",
+     "The human-engineering programme a contractor runs during development: analysis, design support and test.", ""),
+    ("MIL-STD-1474", "DoD", "Standard", "Environment & test",
+     "Noise Limits",
+     "Noise limits for military materiel, to protect hearing and keep speech communication possible.", ""),
+    ("MIL-STD-889", "DoD", "Standard", "Parts & workmanship",
+     "Galvanic Compatibility of Electrically Conductive Materials",
+     "Which metal pairs corrode in contact, and how to protect dissimilar-metal joints.", ""),
+    ("MIL-STD-11991", "DoD", "Standard", "Parts & workmanship",
+     "General Standard for Parts, Materials, and Processes",
+     "Requirements for a parts, materials and processes programme: selection, approval, obsolescence and counterfeit avoidance.", ""),
+    ("MIL-HDBK-454", "DoD", "Handbook", "Parts & workmanship",
+     "General Guidelines for Electronic Equipment",
+     "Common design guidelines for electronic equipment: materials, parts, wiring, marking and safety.", ""),
+    ("MIL-STD-2073-1", "DoD", "Standard", "Logistics & support",
+     "Standard Practice for Military Packaging",
+     "How to specify military packaging levels and methods for storage and shipment.", ""),
+    ("MIL-STD-1366", "DoD", "Standard", "Logistics & support",
+     "Transportability Criteria",
+     "Size and weight limits for moving equipment by road, rail, sea and air.", ""),
+    ("MIL-STD-1791", "DoD", "Standard", "Logistics & support",
+     "Designing for Internal Aerial Delivery in Fixed Wing Aircraft",
+     "Design requirements for cargo carried inside military transport aircraft: restraint, loading and dimensions.", ""),
+    ("MIL-STD-3034", "DoD", "Standard", "Logistics & support",
+     "Reliability-Centered Maintenance (RCM) Process",
+     "The RCM method for choosing maintenance tasks from failure modes and their consequences.", ""),
+    ("MIL-HDBK-502", "DoD", "Handbook", "Logistics & support",
+     "Product Support Analysis",
+     "The analyses that shape how a system is supported: maintenance planning, supply support and support equipment.", ""),
     ("NASA-STD-5001", "NASA", "Standard", "Structures",
      "Structural Design and Test Factors of Safety for Spaceflight Hardware",
      "Minimum design and test factors of safety for metallic, composite and other structures.", ""),
@@ -1731,12 +1780,6 @@ _STD = [
     ("NASA-STD-7001", "NASA", "Standard", "Environment & test",
      "Payload Vibroacoustic Test Criteria",
      "Minimum random vibration and acoustic test levels and durations for flight hardware.", ""),
-    ("NASA-STD-7003", "NASA", "Standard", "Environment & test",
-     "Pyroshock Test Criteria",
-     "How to set pyroshock test levels and run the tests, useful wherever stage separation or ordnance shocks occur.", ""),
-    ("NASA-HDBK-7005", "NASA", "Handbook", "Environment & test",
-     "Dynamic Environmental Criteria",
-     "Deriving vibration, acoustic and shock environments from flight data and predictions.", ""),
     ("NASA-STD-6016", "NASA", "Standard", "Parts & workmanship",
      "Standard Materials and Processes Requirements for Spacecraft",
      "Materials and processes requirements: flammability, outgassing, stress-corrosion and fluid compatibility.", ""),
@@ -1751,7 +1794,61 @@ STD_KINDS = ["Standard", "Handbook", "Test method", "Specification", "Guide"]
 # no design, test or qualification guides for weapon subsystems).
 STD_REFERENCE_ONLY = {"Munition & fuze safety"}
 # Direct links to the free official PDF, where one is stable (otherwise the card links to the source's search).
-STD_LINKS = {}
+STD_LINKS = {
+    "NASA-STD-5001": "https://standards.nasa.gov/sites/default/files/standards/NASA/B-w/CHANGE-3/3/2022-10-24-NASA-STD-5001B-w-Change-3-Approved.pdf",
+    "NASA-STD-5019": "https://standards.nasa.gov/sites/default/files/standards/NASA/w/CHANGE-4/4/NASA-STD-5019A-w-Change-4-Revalidated-2025-09-05.pdf",
+    "NASA-STD-6016": "https://standards.nasa.gov/sites/default/files/standards/NASA/C-w/Change-1/1/2023-11-15-NASA-STD-6016C-w-Chg-1-Final_0.pdf",
+    "NASA-STD-7001": "https://standards.nasa.gov/system/files/tmp/NASA-STD-7001C%20%20-%20Final%207-14-2026.pdf",
+    "NASA-STD-8739.4": "https://standards.nasa.gov/sites/default/files/standards/NASA/A/4/nasa-std-87394a_w_change_4_0.pdf",
+    "MIL-HDBK-1512": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=208348",
+    "MIL-HDBK-1823": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=206122",
+    "MIL-HDBK-217": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=53939",
+    "MIL-HDBK-263": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=53974",
+    "MIL-HDBK-310": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=202658",
+    "MIL-HDBK-338": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=54022",
+    "MIL-HDBK-454": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=115984",
+    "MIL-HDBK-502": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=201462",
+    "MIL-HDBK-516": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=212162",
+    "MIL-HDBK-520": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=277134",
+    "MIL-HDBK-61": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=202239",
+    "MIL-STD-1168": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=36105",
+    "MIL-STD-11991": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=71353",
+    "MIL-STD-1275": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=36186",
+    "MIL-STD-129": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=35520",
+    "MIL-STD-130": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=35521",
+    "MIL-STD-1316": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=36251",
+    "MIL-STD-1366": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=36714",
+    "MIL-STD-1399": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=36807",
+    "MIL-STD-1472": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=36903",
+    "MIL-STD-1474": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=36905",
+    "MIL-STD-1553": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=36973",
+    "MIL-STD-1576": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=36991",
+    "MIL-STD-1629": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=37027",
+    "MIL-STD-1751": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=37111",
+    "MIL-STD-1760": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=37120",
+    "MIL-STD-1791": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=37147",
+    "MIL-STD-1901": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=106144",
+    "MIL-STD-1916": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=120287",
+    "MIL-STD-202": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=35612",
+    "MIL-STD-2073-1": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=37232",
+    "MIL-STD-2105": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=72079",
+    "MIL-STD-3022": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=275961",
+    "MIL-STD-3034": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=277649",
+    "MIL-STD-31000": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=276980",
+    "MIL-STD-331": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=35714",
+    "MIL-STD-461": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=35789",
+    "MIL-STD-464": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=35794",
+    "MIL-STD-46855": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=113938",
+    "MIL-STD-704": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=35901",
+    "MIL-STD-810": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=35978",
+    "MIL-STD-8591": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=275030",
+    "MIL-STD-881": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=36026",
+    "MIL-STD-882": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=36027",
+    "MIL-STD-883": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=36028",
+    "MIL-STD-889": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=36032",
+    "MIL-STD-961": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=36063",
+    "MIL-STD-962": "https://quicksearch.dla.mil/qsDocDetails.aspx?ident_number=36064",
+}
 
 # ---- Built-in overviews -------------------------------------------------------
 # Written for this tool as a quick orientation. They describe structure and the
@@ -2209,34 +2306,6 @@ STD_DETAIL = {
   "tip": "",
   "related": ["NASA-HDBK-7005", "NASA-STD-7003", "MIL-STD-810"]},
 
-"NASA-STD-7003": {
-  "purpose": "How to set pyroshock test levels and run pyroshock tests.",
-  "applies": "Hardware exposed to shocks from pyrotechnic events such as stage separation, cover jettison and valve firing.",
-  "reqs": [
-    "Specify shock as a shock response spectrum (SRS), usually with Q = 10.",
-    "Derive the maximum expected flight level from test data or prediction.",
-    "Test qualification at the maximum expected level plus 6 dB" + CHK + ".",
-    "Apply the required number of shocks per axis and the SRS tolerance bands.",
-    "Use a suitable test method (actual ordnance, mechanical impact or resonant fixture) and document instrumentation and data checks."],
-  "parts_label": "Main topics",
-  "parts": [["", "SRS specification"], ["", "Test margins"], ["", "Test methods"], ["", "Data validation"]],
-  "tip": "",
-  "related": ["NASA-STD-7001", "NASA-HDBK-7005", "MIL-STD-810"]},
-
-"NASA-HDBK-7005": {
-  "purpose": "How to derive vibration, acoustic and shock environments for flight hardware.",
-  "applies": "Guidance only. Used when writing dynamic environment specifications.",
-  "reqs": [
-    "Define the maximum expected flight environment statistically, commonly the P95/50 level (95th percentile with 50% confidence).",
-    "Use measured flight data where possible, scaled to the new configuration.",
-    "Use prediction methods (for example statistical energy analysis or finite element models) where data are missing.",
-    "Envelope the results into test specifications with appropriate margins."],
-  "parts_label": "Main topics",
-  "parts": [["", "Sources of dynamic loads"], ["", "Data analysis and statistics"], ["", "Prediction methods"],
-            ["", "Specifications and test tailoring"]],
-  "tip": "",
-  "related": ["NASA-STD-7001", "NASA-STD-7003", "MIL-STD-810"]},
-
 "NASA-STD-6016": {
   "purpose": "Materials and processes requirements for spacecraft hardware.",
   "applies": "Materials and processes used in spacecraft and flight hardware.",
@@ -2411,9 +2480,11 @@ def std_index(num):
     with gzip.open(std_index_path(num), "rt", encoding="utf-8") as f:
         meta = json.load(f)
     docs, df = [], Counter()
-    for page, sec, text in meta["chunks"]:
-        tf = Counter(_terms(text))
-        docs.append((page, sec, text, tf, sum(tf.values()) or 1))
+    for c in meta["chunks"]:   # [page, section, text] or [page, section, text, "Method 509.7 Salt Fog"]
+        page, sec, text = c[:3]
+        ctx = c[3] if len(c) > 3 else ""
+        tf = Counter(_terms(text + " " + ctx))
+        docs.append((page, sec, text, tf, sum(tf.values()) or 1, ctx))
         df.update(tf.keys())
     avgdl = sum(d[4] for d in docs) / max(1, len(docs))
     idx = {"meta": {k: v for k, v in meta.items() if k != "chunks"}, "docs": docs, "df": df, "avgdl": avgdl}
@@ -2447,7 +2518,7 @@ def std_search(num, question, top=5):
     bigrams = [a + " " + c for a, c in zip(_TOKEN.findall(qlow), _TOKEN.findall(qlow)[1:])
                if a not in _STOP and c not in _STOP]
     scored = []
-    for i, (page, sec, text, tf, dl) in enumerate(idx["docs"]):
+    for i, (page, sec, text, tf, dl, ctx) in enumerate(idx["docs"]):
         s = 0.0
         for t in q:
             f = tf.get(t)
@@ -2465,11 +2536,11 @@ def std_search(num, question, top=5):
     scored.sort(reverse=True)
     out, used = [], set()
     for s, i in scored:
-        page, sec, text, tf, dl = idx["docs"][i]
+        page, sec, text, tf, dl, ctx = idx["docs"][i]
         if (page, sec) in used:
             continue
         used.add((page, sec))
-        out.append({"page": page, "section": sec, "text": _snippet(text, words), "score": round(s, 2)})
+        out.append({"page": page, "section": sec, "context": ctx, "text": _snippet(text, words), "score": round(s, 2)})
         if len(out) >= top:
             break
     return idx, out, words
@@ -2727,7 +2798,7 @@ function officialLink(s, label) {
   var info = D.sources[s.source];
   var u = safeUrl(s.link) || (info && !s.custom ? info.url : '');
   if (!u) return null;
-  var a = el('a', label || (safeUrl(s.link) ? 'Official PDF' : 'Find on ' + info.name)); a.href = u; a.target = '_blank'; a.rel = 'noopener';
+  var a = el('a', label || (safeUrl(s.link) ? 'Official PDF' : 'Find on ' + (info ? info.name : 'the official site'))); a.href = u; a.target = '_blank'; a.rel = 'noopener';
   return a;
 }
 function copyBtn(label, text) {
@@ -2821,8 +2892,11 @@ function renderDetail() {
   body.replaceChildren();
 
   var get = el('div', null, 'get'), info = D.sources[s.source];
-  get.append(el('p', safeUrl(s.link) ? 'Free official copy, publicly released.' : (info ? info.how : 'Official document'), 'how'));
-  var a = officialLink(s, safeUrl(s.link) ? 'Download PDF' : null); if (a) { a.className = 'btn sm'; get.append(a); }
+  get.append(el('p', s.custom ? 'Official document' : safeUrl(s.link) && s.source === 'DoD'
+    ? 'Free official copy, approved for public release. Opens the document on ASSIST; the newest revision is listed first.'
+    : safeUrl(s.link) && s.source === 'NASA' ? 'Free official PDF from the NASA Technical Standards System.'
+    : (info ? info.how : 'Official document'), 'how'));
+  var a = officialLink(s, safeUrl(s.link) ? 'Get the official PDF' : null); if (a) { a.className = 'btn sm'; get.append(a); }
   get.append(copyBtn('Copy number', function () { return s.num; }));
   body.append(get);
 
@@ -2872,7 +2946,12 @@ function highlighted(text, words) {
 function askBox(s, meta) {
   var box = section('Ask this standard', null, 'ask');
   box.append(el('p', 'Ask in plain words, e.g. "what do I need to do for humidity testing". The answer is the passages of ' +
-    (meta.file || 'the official document') + (meta.revision ? ' (' + meta.revision + ')' : '') + ' that best match your words, quoted as written with their page number.', 'how'));
+    (meta.revision || 'the official document') + ' that best match your words, quoted as written with their page number. Searches one standard at a time.', 'how'));
+  var norm = function (v) { return (v || '').toLowerCase().replace(/\(.*?\)/g, '').replace(/[^a-z0-9]/g, ''); };
+  if (meta.current && norm(meta.current) !== norm(meta.revision)) {
+    box.append(el('p', 'Note: this search uses ' + meta.revision + '. The current version on ASSIST is ' + meta.current +
+      ', which may change some requirements. Check the official copy before relying on an answer.', 'how err'));
+  }
   var f = el('form'), inp = el('input'), b = el('button', 'Ask', 'btn sm');
   inp.type = 'search'; inp.maxLength = 300; inp.placeholder = 'Type your question'; inp.setAttribute('aria-label', 'Question about ' + s.num);
   b.type = 'submit';
@@ -2900,7 +2979,7 @@ function askBox(s, meta) {
         msg.textContent = 'Best ' + j.answers.length + ' passages from the document. Check the full text on the page shown before relying on it.';
         j.answers.forEach(function (a) {
           var li = el('li'), w = el('div', null, 'where');
-          w.append(el('span', 'Page ' + a.page), el('span', a.section ? 'Section ' + a.section : ''));
+          w.append(el('span', 'PDF page ' + a.page), el('span', [a.context, a.section ? 'Section ' + a.section : ''].filter(Boolean).join(' · ')));
           li.append(w, highlighted(a.text, j.words));
           list.append(li);
         });
