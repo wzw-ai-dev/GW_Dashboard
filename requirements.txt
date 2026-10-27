@@ -2,3 +2,5 @@ flask
 gunicorn
 tzdata
 pypdf
+openpyxl
+pillow
