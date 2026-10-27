@@ -31,6 +31,7 @@ def require_login():
 NEWSDATA_KEY = os.environ.get("NEWSDATA_API_KEY")  # set on Render, never in this file
 MAX_NEWSDATA_CALLS_PER_DAY = 150   # free plan allows about 200; stay under it
 TOP_N = 10
+NEWS_MAX_AGE_DAYS = 20   # if today has fewer than TOP_N stories, top up with ones up to this old
 TIMEOUT = 12
 UA = "Mozilla/5.0 (compatible; GWDashboard/1.0)"
 
@@ -123,7 +124,7 @@ def fetch_gdelt(query):
         _gdelt_last[0] = time.time()
     data = http_json("https://api.gdeltproject.org/api/v2/doc/doc?" + urlencode({
         "query": query, "mode": "artlist", "maxrecords": "50",
-        "format": "json", "sort": "datedesc", "timespan": "7d"}))
+        "format": "json", "sort": "datedesc", "timespan": "%dd" % NEWS_MAX_AGE_DAYS}))
     out = []
     for a in data.get("articles") or []:
         try:
@@ -156,7 +157,7 @@ GH_BRANCH = os.environ.get("GH_BRANCH", "data")      # NOT your deploy branch, o
 GH_PATH = os.environ.get("GH_PATH", "gw_news_history.json")
 DATA_FILE = os.environ.get("GW_DATA_FILE", "gw_news_history.json")
 RETRY_GAP = 900          # after a failed update, wait this long before trying again
-KEEP_DAYS = 7            # days of snapshots kept
+KEEP_DAYS = 21           # days of snapshots kept (older days top up a topic that has few new stories)
 # ------------------------------------------------------------------------------
 
 lock = threading.Lock()          # held while an update runs
@@ -328,11 +329,13 @@ def collect_top(topic):
                 steps.append(dict(step, topic=topic))
         if articles:
             used = "NewsData.io"
-    if not articles:
-        articles, step = attempt("GDELT", fetch_gdelt, cfg["gdelt"])
+    # NewsData's free plan only covers about two days; when that gives few stories, GDELT adds the last few weeks
+    if len(articles) < TOP_N * 3:
+        more, step = attempt("GDELT", fetch_gdelt, cfg["gdelt"])
         steps.append(dict(step, topic=topic))
-        if articles:
-            used = "GDELT"
+        if more:
+            articles += more
+            used = used + " + GDELT" if used else "GDELT"
 
     seen = {}
     for a in articles:
@@ -639,6 +642,26 @@ def kick_update():
     return False
 
 
+def topic_items(topic):
+    """The latest snapshot's stories for a topic, topped up to TOP_N with the newest stories from earlier
+    snapshots (no repeats, nothing older than NEWS_MAX_AGE_DAYS)."""
+    out, seen = [], set()
+    cutoff = time.time() - NEWS_MAX_AGE_DAYS * 86400
+    for n, day in enumerate(sorted(store["days"], reverse=True)):
+        items = store["days"][day].get("topics", {}).get(topic, [])
+        if n:   # earlier days: newest first
+            items = sorted(items, key=lambda i: i.get("ts", 0), reverse=True)
+        for i in items:
+            key = re.sub(r"[^a-z0-9]", "", (i.get("title") or "").lower())[:60]
+            if key in seen or i.get("link") in seen or (n and i.get("ts", 0) < cutoff):
+                continue
+            seen.update((key, i.get("link")))
+            out.append(dict(i, rank=len(out) + 1, earlier=bool(n)))
+            if len(out) >= TOP_N:
+                return out
+    return out
+
+
 @app.route("/api/news")
 def news():
     updating = kick_update() or state["running"]
@@ -648,7 +671,7 @@ def news():
     topic = request.args.get("topic")
     return jsonify({
         "topics": list(NEWS_TOPICS), "topic": topic,
-        "items": saved.get(topic, []) if topic in NEWS_TOPICS else [],
+        "items": topic_items(topic) if topic in NEWS_TOPICS else [],
         "slot": latest, "source": (d or {}).get("source"),
         "updated_label": nice(datetime.fromtimestamp(d["fetched"], tz())) if d and saved else None,
         "next_label": nice(next_update_time()), "tz": GW_TZ,
@@ -1326,25 +1349,27 @@ threading.Thread(target=research_warmup, daemon=True).start()
 
 @app.route("/api/research/landscape")
 def research_landscape():
-    """Every published system of a type (or of all types) that has both a range and a speed, for the chart."""
+    """Every published system of a type (or of all types) with a range and/or a speed, for the two charts."""
     t = (request.args.get("type") or "").strip()
     types = [t] if t in RESEARCH_TYPES else list(RESEARCH_TYPES)
     if request_types(types):
         return jsonify({"state": "loading", "progress": rs_progress()})
-    seen, points, without = set(), [], 0
+    seen, points, total = set(), [], 0
     for tt in types:
         for e in RS["data"][tt]["entries"]:
             if e["title"] in seen:
                 continue
             seen.add(e["title"])
+            total += 1
             r, s = e["num"].get("Range"), e["num"].get("Speed")
             km = max(r) / 1000 if r else 0
             mach = max(s) / MACH_MS if s else 0
-            if not (0.1 <= km <= 20000 and 0.05 <= mach <= 40):   # needs both, and plausible values
-                without += 1
+            km = round(km, 2) if 0.1 <= km <= 20000 else None      # plausible values only
+            mach = round(mach, 2) if 0.05 <= mach <= 40 else None
+            if km is None and mach is None:
                 continue
-            points.append({"title": e["title"], "url": wiki_url(e["title"]), "km": round(km, 2), "mach": round(mach, 2)})
-    return jsonify({"state": "ready", "type": t if t in RESEARCH_TYPES else None, "points": points, "without": without})
+            points.append({"title": e["title"], "url": wiki_url(e["title"]), "km": km, "mach": mach})
+    return jsonify({"state": "ready", "type": t if t in RESEARCH_TYPES else None, "points": points, "total": total})
 
 
 @app.route("/api/research/options")
@@ -1535,7 +1560,7 @@ def research_export():
     columns = [export_column(entries.get(r["title"], {}), r["title"] in ad_titles) for r in results]
     now = local_now()
     notes = [
-        "Exported from Guided Weapons University · Market Research on %s." % now.strftime("%d %b %Y %H:%M"),
+        "Exported from GW University · Market Research on %s." % now.strftime("%d %b %Y %H:%M"),
         "Values are published figures from each system's Wikipedia infobox (refreshed daily at 6am) and may be incomplete, rounded or disputed.",
         "m/s and Mach are converted at 340.3 m/s = Mach 1 (sea level). '%s' means the source does not state it." % NOT_FOUND,
         "Wikipedia text is available under CC BY-SA; see each source link for credits.",
@@ -1959,7 +1984,7 @@ STD_DETAIL = {
   "related": ["MIL-STD-1760", "MIL-STD-704"]},
 
 "MIL-STD-1760": {
-  "purpose": "Defines the electrical interface between an aircraft and a smart store such as a guided weapon, so stores and aircraft can be integrated without custom wiring.",
+  "purpose": "Defines the electrical interface between an aircraft and a smart store such as a missile, so stores and aircraft can be integrated without custom wiring.",
   "applies": "Aircraft stations (Aircraft Station Interface) and mission stores (Mission Store Interface), plus carriage stores in between.",
   "reqs": [
     "Provide the interface signal set: dual 1553 data bus, high-bandwidth (video/RF) and low-bandwidth (audio) lines, and the defined discretes.",
@@ -2732,7 +2757,7 @@ dialog::backdrop{background:rgb(5 8 10 / .72)}
 <main class="page">
   <a class="back" href="/">&larr; Home</a>
   <h1>Standards Library</h1>
-  <p class="lede">Free, publicly released standards that guided-weapon engineers use in acquisition and design. Open a standard to get the official document, read a quick overview, or ask it a question: answers are passages quoted from the document itself, with page numbers.</p>
+  <p class="lede">Free, publicly released standards that engineers use in acquisition and design. Open a standard to get the official document, read a quick overview, or ask it a question: answers are passages quoted from the document itself, with page numbers.</p>
 
   <div class="search">
     <input id="q" type="search" placeholder="Search number, title or topic, e.g. 810, vibration, 1553" aria-label="Search standards" autocomplete="off">
@@ -3157,7 +3182,7 @@ h1{margin:0;font-family:var(--display);font-weight:700;font-size:clamp(1.8rem,5v
     <h1>Top 10 News</h1>
     <p class="st" id="st" aria-live="polite"></p>
     <div class="topics" id="topics" role="group" aria-label="Choose a topic"></div>
-    <p class="hint" id="hint">Choose a topic to see today's top 10 stories.</p>
+    <p class="hint" id="hint">Choose a topic to see its 10 latest top stories.</p>
 
     <section class="board" id="board" hidden aria-live="polite">
       <h2>Top 10 · <span id="bt"></span></h2>
@@ -4029,6 +4054,479 @@ BATTLE_LAB = {
                      desc="Philippine Air Force air defence, inducted in November 2022; three batteries bought.")),
         ]},
 }
+# ---- howitzers, rocket systems, drones and counter-drone defences (added October 2026) ----
+# Gun ranges depend on the shell: rings use the figure named in ring_note. Drone rings use a published
+# range or datalink range, which is a reach from the launch site, not a combat radius.
+NA = "Not applicable"
+K9 = _sys("K9 Thunder", "Self-propelled howitzer, 155 mm", "In service", "K9 Thunder",
+          "South Korean tracked howitzer, the most widely exported of its kind.",
+          "About 40 km with extended-range shells (reported)", NA, 40, "With extended-range shells, reported", "Hanwha Aerospace")
+PZH2000 = _sys("PzH 2000", "Self-propelled howitzer, 155 mm", "In service", "Panzerhaubitze 2000",
+               "German tracked howitzer, in service since 1998 and used heavily in Ukraine.",
+               "About 30 km; about 40 km with base-bleed shells (reported)", NA, 40, "With base-bleed shells, reported",
+               "KNDS Deutschland (Krauss-Maffei Wegmann)")
+CAESAR = _sys("CAESAR", "Truck-mounted howitzer, 155 mm", "In service", "CAESAR self-propelled howitzer",
+              "French howitzer mounted on a 6x6 truck, quick to set up and move.",
+              "About 40 km with extended-range shells (reported)", NA, 40, "With extended-range shells, reported", "KNDS France (Nexter)")
+ARCHER = _sys("Archer", "Truck-mounted howitzer, 155 mm", "In service", "Archer Artillery System",
+              "Swedish automated howitzer on a 6x6 truck, operated from an armoured cab.",
+              "About 40 km; about 50 km with Excalibur guided shells (reported)", NA, 40, "With standard extended-range shells",
+              "BAE Systems Bofors")
+M777 = _sys("M777", "Towed howitzer, 155 mm", "In service", "M777 howitzer",
+            "Lightweight towed howitzer that can be carried by helicopter.",
+            "About 24 km; about 30 km with rocket-assisted shells; about 40 km with Excalibur (reported)", NA,
+            30, "With rocket-assisted shells, reported", "BAE Systems")
+HIMARS = _sys("HIMARS", "Wheeled rocket launcher", "In service", "M142 HIMARS",
+              "US truck-mounted launcher for six GMLRS rockets or one ATACMS / two PrSM missiles (those are listed under Ballistic missiles).",
+              "About 70 to 80 km with GMLRS rockets (reported)", NA, 80, "GMLRS rockets, upper reported figure", "Lockheed Martin")
+M270 = _sys("M270", "Tracked rocket launcher", "In service", "M270 Multiple Launch Rocket System",
+            "Tracked launcher carrying twelve GMLRS rockets, used by the US and several European armies.",
+            "About 70 to 80 km with GMLRS rockets (reported)", NA, 80, "GMLRS rockets, upper reported figure", "Lockheed Martin")
+CHUNMOO = _sys("K239 Chunmoo", "Wheeled rocket launcher", "In service", "K239 Chunmoo",
+               "South Korean launcher for guided rockets and longer-range tactical missiles.",
+               "About 80 km with 239 mm guided rockets; about 290 km with CTM-290 missiles (reported)", NA,
+               80, "Guided rockets, reported", "Hanwha Aerospace")
+ASTROS = _sys("Astros II", "Wheeled rocket launcher", "In service", "Astros II MLRS",
+              "Brazilian truck-mounted rocket system firing several rocket sizes.",
+              "About 9 to 90 km depending on the rocket (reported)", NA, 90, "Longest-range rocket, reported", "Avibras")
+MQ9 = _sys("MQ-9 Reaper", "Armed drone (medium altitude, long endurance)", "In service", "General Atomics MQ-9 Reaper",
+           "US armed drone flown by satellite link, in service since 2007.",
+           "About 1,850 km range (published)", "About 370 km/h cruise (published)",
+           1850, "Published range; it can only strike well inside this from its base", "General Atomics")
+MQ9B = _sys("MQ-9B", "Armed drone (medium altitude, long endurance)", "In service", "General Atomics MQ-9B",
+            "Newer version of the Reaper certified to fly in civil airspace (SkyGuardian, SeaGuardian, Protector).",
+            "Over 40 hours endurance; range not published", "Not published", maker="General Atomics")
+TB2 = _sys("Bayraktar TB2", "Armed drone (medium altitude)", "In service", "Bayraktar TB2",
+           "Turkish armed drone, exported to over 30 countries and used in several recent wars.",
+           "About 150 km line-of-sight datalink range (published)", "About 130 km/h cruise (published)",
+           150, "Datalink range from its ground station", "Baykar")
+AKINCI = _sys("Bayraktar Akıncı", "Armed drone (high altitude, long endurance)", "In service", "Baykar Bayraktar Akıncı",
+              "Larger Turkish armed drone that carries guided bombs and cruise missiles.",
+              "About 300 km line-of-sight datalink range; further by satellite (reported)", "About 240 km/h cruise (reported)",
+              300, "Line-of-sight datalink range, reported", "Baykar")
+WINGLOONG2 = _sys("Wing Loong II", "Armed drone (medium altitude, long endurance)", "In service", "CAIG Wing Loong II",
+                  "Chinese armed drone, widely exported in the Middle East and Africa.",
+                  "About 1,500 km range (reported)", "About 370 km/h top speed (reported)", 1500, "Reported range",
+                  "AVIC (Chengdu Aircraft Design Institute)")
+CH4 = _sys("CH-4 Rainbow", "Armed drone (medium altitude, long endurance)", "In service", "CASC Rainbow",
+           "Chinese armed drone family, exported to several countries.",
+           "Not consistently published; endurance about 30 to 40 hours (reported)", "Not published", maker="CASC")
+HAROP = _sys("Harop", "Loitering munition", "In service", "IAI Harop",
+             "Israeli loitering munition that can home on radar emissions or be guided by an operator.",
+             "About 1,000 km (reported)", "Not published", 1000, "Reported figure", "Israel Aerospace Industries")
+HARPY = _sys("Harpy", "Loitering munition (anti-radar)", "In service", "IAI Harpy",
+             "Israeli anti-radar loitering munition, the predecessor of Harop.",
+             "About 500 km (reported)", "Not published", 500, "Reported figure", "Israel Aerospace Industries")
+SB600 = _sys("Switchblade 600", "Loitering munition", "In service", "AeroVironment Switchblade",
+             "US tube-launched loitering munition for use against armoured vehicles.",
+             "Over 40 km (published)", "About 185 km/h dash (published)", 40, "Published figure", "AeroVironment")
+WARMATE = _sys("Warmate", "Loitering munition", "In service", "WB Electronics Warmate",
+               "Polish small loitering munition, used by Poland and Ukraine.",
+               "About 12 to 30 km depending on version (reported)", "Not published", 30, "Upper reported figure", "WB Group")
+SHAHED136 = _sys("Shahed-136", "One-way attack drone", "In service", "HESA Shahed 136",
+                 "Iranian long-range one-way attack drone with a piston engine; built in Russia as the Geran-2.",
+                 "About 2,000 to 2,500 km (reported)", "About 185 km/h (reported)", 2000, "Lower reported figure",
+                 "Shahed Aviation Industries")
+GEPARD = _sys("Gepard", "Self-propelled anti-aircraft gun, 35 mm", "In service", "Flakpanzer Gepard",
+              "German twin-35 mm gun tank, retired by Germany but highly effective against drones in Ukraine.",
+              "About 5.5 km (reported)", NA, 5.5, "Reported figure", "Krauss-Maffei Wegmann")
+SKYNEX = _sys("Skynex / Skyshield", "Air-defence gun system, 35 mm", "In service", "Skyshield",
+              "Revolver guns firing AHEAD airburst shells, linked to a fire-control radar.",
+              "About 4 km (reported)", NA, 4, "Reported figure", "Rheinmetall Air Defence")
+COYOTE = _sys("Coyote Block 2", "Interceptor drone", "In service", "Raytheon Coyote",
+              "Jet-powered interceptor drone launched from a ground launcher to destroy drones.",
+              "About 10 to 15 km (reported)", "About 555 km/h (reported)", 15, "Upper reported figure", "Raytheon (RTX)")
+
+BATTLE_LAB.update({
+    "Howitzers": {
+        "group": "Strike", "short": "Howitzers",
+        "blurb": "Large guns, self-propelled or towed, that fire shells in a high arc. Rings show range with the shell named.",
+        "countries": [
+            _cty("USA",
+                 _sys("M109A7 Paladin", "Self-propelled howitzer, 155 mm", "In service", "M109 howitzer",
+                      "Latest version of the long-serving US tracked howitzer.",
+                      "About 22 km; about 30 km with rocket-assisted shells (reported)", NA, 30,
+                      "With rocket-assisted shells, reported", "BAE Systems"),
+                 M777),
+            _cty("KOR", K9),
+            _cty("DEU", PZH2000),
+            _cty("FRA", CAESAR),
+            _cty("SWE", ARCHER),
+            _cty("GBR",
+                 _as(ARCHER, "Sweden", desc="Bought from Sweden in 2023 as an interim replacement for the AS-90 guns given to Ukraine."),
+                 _sys("RCH 155", "Wheeled howitzer, 155 mm", "On order", "RCH 155",
+                      "German wheeled howitzer chosen to replace the British Army's interim guns.",
+                      "About 40 km (reported)", NA, 40, "Reported figure", "KNDS Deutschland", "Germany")),
+            _cty("RUS",
+                 _sys("2S19 Msta-S", "Self-propelled howitzer, 152 mm", "In service", "2S19 Msta",
+                      "Russia's main tracked howitzer.",
+                      "About 25 km; about 29 km with base-bleed shells (reported)", NA, 29, "With base-bleed shells, reported",
+                      "Uraltransmash"),
+                 _sys("2S35 Koalitsiya-SV", "Self-propelled howitzer, 152 mm", "Reported in service", "2S35 Koalitsiya-SV",
+                      "Newer Russian howitzer with an uncrewed turret, in limited numbers.",
+                      "About 70 km (claimed)", NA, 70, "Claimed figure", "Uraltransmash")),
+            _cty("CHN",
+                 _sys("PLZ-05", "Self-propelled howitzer, 155 mm", "In service", "PLZ-05",
+                      "Chinese tracked howitzer.",
+                      "About 39 km; about 53 km with rocket-assisted shells (reported)", NA, 39, "Standard extended-range shells, reported",
+                      "Norinco"),
+                 _sys("PCL-181", "Truck-mounted howitzer, 155 mm", "In service", "PCL-181",
+                      "Chinese truck-mounted howitzer, lighter and faster to deploy than tracked guns.",
+                      "About 40 km (reported)", NA, 40, "Reported figure", "Norinco")),
+            _cty("IND",
+                 _as(K9, "South Korea", name="K9 Vajra-T", desc="Indian version of the K9, built under licence in India by Larsen & Toubro."),
+                 _sys("ATAGS", "Towed howitzer, 155 mm", "On order", "Advanced Towed Artillery Gun System",
+                      "Indian-designed towed howitzer; a production contract for 307 guns was signed in 2025.",
+                      "About 48 km (reported)", NA, 48, "Reported figure", "DRDO with Bharat Forge and Tata Advanced Systems"),
+                 _as(M777, "United States", desc="Bought from the US for mountain units; partly assembled in India.")),
+            _cty("PAK",
+                 _sys("SH-15", "Truck-mounted howitzer, 155 mm", "In service", "SH-15",
+                      "Chinese truck-mounted howitzer bought by Pakistan.",
+                      "About 40 to 53 km depending on the shell (reported)", NA, 40, "Lower reported figure", "Norinco", "China")),
+            _cty("PRK",
+                 _sys("Koksan (M1989)", "Self-propelled gun, 170 mm", "In service", "Koksan (gun)",
+                      "Very long-barrelled North Korean gun; some were supplied to Russia in 2024.",
+                      "About 40 km; about 60 km with rocket-assisted shells (reported)", NA, 60, "With rocket-assisted shells, reported")),
+            _cty("TUR",
+                 _sys("T-155 Fırtına", "Self-propelled howitzer, 155 mm", "In service", "T-155 Fırtına",
+                      "Turkish howitzer based on the K9.",
+                      "About 40 km (reported)", NA, 40, "Reported figure", "MKE and Aselsan")),
+            _cty("POL",
+                 _sys("AHS Krab", "Self-propelled howitzer, 155 mm", "In service", "AHS Krab",
+                      "Polish tracked howitzer, also supplied to Ukraine.",
+                      "About 40 km (reported)", NA, 40, "Reported figure", "Huta Stalowa Wola"),
+                 _as(K9, "South Korea", name="K9PL", desc="Bought from South Korea from 2022; later batches assembled in Poland.")),
+            _cty("UKR",
+                 _sys("2S22 Bohdana", "Truck-mounted howitzer, 155 mm", "In service", "2S22 Bohdana",
+                      "Ukrainian-built truck-mounted howitzer, in production since 2023.",
+                      "About 40 km (reported)", NA, 40, "Reported figure"),
+                 _as(PZH2000, "Germany", desc="Supplied by Germany and the Netherlands since 2022."),
+                 _as(CAESAR, "France", desc="Supplied by France and Denmark since 2022."),
+                 _as(M777, "United States", desc="Supplied by the US, Canada and Australia since 2022.")),
+            _cty("NOR", _as(K9, "South Korea", name="K9 Vidar", desc="Norwegian Army's K9s, in service since 2019.")),
+            _cty("ITA", _as(PZH2000, "Germany", desc="Built under licence in Italy.")),
+            _cty("AUS",
+                 _as(K9, "South Korea", name="AS9 Huntsman", status="Fielding",
+                     desc="Australian version of the K9, built in Geelong, Victoria, by Hanwha Defense Australia."),
+                 _as(M777, "United States", desc="Australian Army towed howitzer.")),
+            _cty("JPN",
+                 _sys("Type 99", "Self-propelled howitzer, 155 mm", "In service", "Type 99 155 mm self-propelled howitzer",
+                      "Japanese tracked howitzer.", "About 30 km (reported)", NA, 30, "Reported figure", "Japan Steel Works"),
+                 _sys("Type 19", "Truck-mounted howitzer, 155 mm", "Fielding", "Type 19 155 mm wheeled self-propelled howitzer",
+                      "Japanese truck-mounted howitzer replacing towed guns.", "Not published", NA, maker="Japan Steel Works")),
+            _cty("ISR",
+                 _sys("M109 Doher", "Self-propelled howitzer, 155 mm", "In service", "M109 howitzer",
+                      "Israeli-upgraded M109, being replaced by a new Elbit howitzer.",
+                      "About 22 to 30 km depending on the shell (reported)", NA, 30, "Upper reported figure", "BAE Systems", "United States")),
+            _cty("SAU",
+                 _as(CAESAR, "France", desc="Royal Saudi Land Forces truck-mounted howitzer."),
+                 _sys("PLZ-45", "Self-propelled howitzer, 155 mm", "In service", "PLZ-45",
+                      "Chinese tracked howitzer bought by Saudi Arabia.",
+                      "About 39 km with base-bleed shells (reported)", NA, 39, "With base-bleed shells, reported", "Norinco", "China")),
+            _cty("ARE",
+                 _sys("G6 Rhino", "Wheeled howitzer, 155 mm", "In service", "G6 howitzer",
+                      "South African six-wheeled howitzer bought by the UAE.",
+                      "About 30 km; about 39 km with base-bleed shells (reported)", NA, 39, "With base-bleed shells, reported",
+                      "Denel", "South Africa")),
+            _cty("SGP",
+                 _sys("SSPH Primus", "Self-propelled howitzer, 155 mm", "In service", "SSPH Primus",
+                      "Singapore-designed tracked howitzer, in service since 2004.",
+                      "19 km; 30 km with rocket-assisted shells (MINDEF)", NA, 30, "With rocket-assisted shells (MINDEF)",
+                      "ST Engineering"),
+                 _sys("FH-2000", "Towed howitzer, 155 mm", "In service", "FH-2000",
+                      "Singapore-designed towed howitzer with a long 52-calibre barrel.",
+                      "19 km; about 40 km with base-bleed shells (reported)", NA, 40, "With base-bleed shells, reported",
+                      "ST Engineering"),
+                 _sys("Pegasus", "Light towed howitzer, 155 mm", "In service", "Pegasus (howitzer)",
+                      "Singapore-designed lightweight howitzer that can be lifted by helicopter and drive itself short distances.",
+                      "Not officially published", NA, maker="ST Engineering")),
+            _cty("MYS",
+                 _sys("G5 Mk III", "Towed howitzer, 155 mm", "In service", "G5 howitzer",
+                      "South African towed howitzer; the Malaysian Army's guns were upgraded locally with a new fire-control system.",
+                      "About 39 km (reported)", NA, 39, "Reported figure", "Denel", "South Africa")),
+            _cty("IDN", _as(CAESAR, "France", desc="55 in Indonesian Army service since 2016.")),
+            _cty("PHL",
+                 _sys("ATMOS 2000", "Truck-mounted howitzer, 155 mm", "In service", "ATMOS 2000",
+                      "Israeli truck-mounted howitzer; 12 delivered in 2021 and operational with the Philippine Army since 2022.",
+                      "Up to 41 km with extended-range shells (Philippine Army)", NA, 41, "With extended-range shells",
+                      "Elbit Systems", "Israel")),
+            _cty("BRA",
+                 _sys("M109A5+", "Self-propelled howitzer, 155 mm", "In service", "M109 howitzer",
+                      "Upgraded US-built M109s in Brazilian Army service.",
+                      "About 22 to 30 km depending on the shell (reported)", NA, 30, "Upper reported figure", "BAE Systems", "United States")),
+        ]},
+
+    "Rocket Systems": {
+        "group": "Strike", "short": "Rocket Systems",
+        "blurb": "Multiple rocket launchers on trucks or tracked vehicles, firing unguided and guided rockets.",
+        "countries": [
+            _cty("USA", HIMARS, M270),
+            _cty("RUS",
+                 _sys("Tornado-S", "Wheeled rocket launcher, 300 mm", "In service", "9A52-4 Tornado",
+                      "Modernised successor to the BM-30 Smerch, with guided rockets.",
+                      "About 120 km (reported)", NA, 120, "Reported figure", "Splav (Tecmash)"),
+                 _sys("BM-21 Grad", "Wheeled rocket launcher, 122 mm", "In service", "BM-21 Grad",
+                      "Soviet-era truck launcher for forty unguided rockets, still widely used.",
+                      "About 20 km (reported)", NA, 20, "Reported figure", "Splav (Tecmash)")),
+            _cty("CHN",
+                 _sys("PHL-16 (PCH-191)", "Wheeled rocket launcher", "In service", "PCH-191",
+                      "Chinese launcher that fires rockets and tactical ballistic missiles from the same vehicle.",
+                      "About 70 to 130 km with rockets; up to about 350 km with missiles (reported)", NA,
+                      130, "Rockets, upper reported figure", "Norinco"),
+                 _sys("PHL-03", "Wheeled rocket launcher, 300 mm", "In service", "PHL-03",
+                      "Chinese twelve-tube 300 mm rocket launcher.",
+                      "About 70 to 130 km (reported)", NA, 130, "Upper reported figure", "Norinco")),
+            _cty("KOR", CHUNMOO),
+            _cty("PRK",
+                 _sys("KN-25", "Wheeled rocket launcher, 600 mm", "In service", "KN-25",
+                      "North Korea calls it a super-large rocket launcher; analysts class its rockets as short-range ballistic missiles.",
+                      "About 380 km (reported)", NA, 380, "Reported test range")),
+            _cty("IND",
+                 _sys("Pinaka", "Wheeled rocket launcher, 214 mm", "In service", "Pinaka multi-barrel rocket launcher",
+                      "Indian rocket system; guided and extended-range rockets are in production.",
+                      "About 40 to 60 km; about 75 to 90 km for guided rockets (reported)", NA, 75, "Guided rockets, lower reported figure",
+                      "DRDO, built by Indian industry")),
+            _cty("PAK",
+                 _sys("Fatah-I", "Guided rocket system", "In service", "Fatah (rocket)",
+                      "Pakistani guided rocket system, first tested in 2021.",
+                      "About 140 km (reported)", NA, 140, "Reported figure"),
+                 _sys("Fatah-II", "Guided rocket system", "Tested", "Fatah (rocket)",
+                      "Longer-range Pakistani guided rocket, tested in 2024.",
+                      "About 400 km (reported)", NA, 400, "Reported figure"),
+                 _sys("A-100", "Wheeled rocket launcher, 300 mm", "In service", "A-100 (rocket launcher)",
+                      "Chinese ten-tube rocket launcher bought by Pakistan.",
+                      "About 120 km (reported)", NA, 120, "Reported figure", made_in="China")),
+            _cty("TUR",
+                 _sys("TRG-300 Kasırga", "Guided rocket system, 300 mm", "In service", "TRG-300 Kasırga",
+                      "Turkish guided rocket, fired from wheeled launchers.",
+                      "About 90 to 120 km (reported)", NA, 120, "Upper reported figure", "Roketsan")),
+            _cty("UKR",
+                 _sys("Vilkha", "Guided rocket system, 300 mm", "In service", "Vilkha",
+                      "Ukrainian guided rocket fired from modified Smerch launchers.",
+                      "About 70 km; about 110 km for Vilkha-M (reported)", NA, 110, "Vilkha-M, reported", "Luch Design Bureau"),
+                 _as(HIMARS, "United States", desc="Supplied by the US since June 2022."),
+                 _as(M270, "United States", desc="Supplied by the UK, Germany and others since 2022.")),
+            _cty("POL",
+                 _as(CHUNMOO, "South Korea", name="Homar-K", desc="Polish version of Chunmoo on a Polish Jelcz truck, delivered since 2023."),
+                 _as(HIMARS, "United States", name="Homar-A (HIMARS)", status="On order", desc="Ordered from the US for the Polish Army."),
+                 _sys("WR-40 Langusta", "Wheeled rocket launcher, 122 mm", "In service", "WR-40 Langusta",
+                      "Polish modernised Grad-type launcher.",
+                      "About 20 to 40 km depending on the rocket (reported)", NA, 40, "Upper reported figure", "Huta Stalowa Wola")),
+            _cty("DEU", _as(M270, "United States", name="MARS II (M270)", desc="German Army version of M270.")),
+            _cty("FRA", _as(M270, "United States", name="LRU (M270)", desc="French Army version of M270.")),
+            _cty("ITA", _as(M270, "United States", desc="Italian Army M270, upgraded to fire GMLRS.")),
+            _cty("GBR", _as(M270, "United States", name="M270A2", desc="British Army launchers, upgraded to the A2 standard.")),
+            _cty("AUS", _as(HIMARS, "United States", desc="Australian Army launchers, in service since 2024.")),
+            _cty("TWN",
+                 _sys("Thunderbolt-2000", "Wheeled rocket launcher", "In service", "Thunderbolt-2000",
+                      "Taiwanese truck-mounted rocket system.",
+                      "About 45 km (reported)", NA, 45, "Reported figure", "NCSIST"),
+                 _as(HIMARS, "United States", desc="Delivered to Taiwan since 2024.")),
+            _cty("IRN",
+                 _sys("Fajr-5", "Rocket launcher, 333 mm", "In service", "Fajr-5",
+                      "Iranian heavy rocket, also supplied to allied groups in the region.",
+                      "About 75 km (reported)", NA, 75, "Reported figure")),
+            _cty("SAU", _as(ASTROS, "Brazil", desc="Royal Saudi Land Forces rocket system.")),
+            _cty("ARE", _as(HIMARS, "United States", desc="UAE Land Forces launchers.")),
+            _cty("SGP", _as(HIMARS, "United States", desc="Singapore Army launchers, in service since 2011.")),
+            _cty("MYS", _as(ASTROS, "Brazil", desc="Malaysian Army Rocket Artillery Brigade, fired each year in exercise Lembing Sakti.")),
+            _cty("IDN", _as(ASTROS, "Brazil", name="Astros II Mk6", desc="Indonesian Army launchers.")),
+            _cty("BRA", _as(ASTROS, None, name="Astros II Mk6", desc="Brazilian Army rocket system, made in Brazil.")),
+        ]},
+
+    "Combat drones": {
+        "group": "Strike", "short": "Combat drones",
+        "blurb": "Armed uncrewed aircraft. Rings show a published range or datalink range from the launch site.",
+        "countries": [
+            _cty("USA", MQ9),
+            _cty("TUR", TB2, AKINCI),
+            _cty("CHN", WINGLOONG2, CH4),
+            _cty("ISR",
+                 _sys("Hermes 900", "Drone (medium altitude, long endurance)", "In service", "Elbit Hermes 900",
+                      "Israeli long-endurance drone; armed versions are reported in Israeli service.",
+                      "About 30 hours endurance; range not published", "Not published", maker="Elbit Systems"),
+                 _sys("Heron TP (Eitan)", "Drone (medium altitude, long endurance)", "In service", "IAI Eitan",
+                      "Large Israeli long-endurance drone; armed versions are reported.",
+                      "Over 30 hours endurance; range not published", "Not published", maker="Israel Aerospace Industries")),
+            _cty("RUS",
+                 _sys("Orion (Inokhodets)", "Armed drone (medium altitude, long endurance)", "In service", "Kronshtadt Orion",
+                      "Russian armed drone, used in Syria and Ukraine.",
+                      "About 250 km datalink range (reported)", "Not published", 250, "Datalink range, reported", "Kronstadt")),
+            _cty("IRN",
+                 _sys("Mohajer-6", "Armed drone (medium altitude)", "In service", "Qods Mohajer-6",
+                      "Iranian armed drone, also supplied to Russia.",
+                      "About 200 km datalink range (reported)", "Not published", 200, "Datalink range, reported", "Qods Aviation Industries"),
+                 _sys("Shahed-129", "Armed drone (medium altitude, long endurance)", "In service", "HESA Shahed 129",
+                      "Iranian long-endurance armed drone.",
+                      "Not reliably published", "Not published", maker="Shahed Aviation Industries")),
+            _cty("PAK",
+                 _sys("Shahpar-III", "Armed drone (medium altitude, long endurance)", "In service", "GIDS Shahpar",
+                      "Pakistani-developed armed drone.", "Not published", "Not published", maker="GIDS"),
+                 _as(TB2, "Turkey", desc="Reported in Pakistani service."),
+                 _as(AKINCI, "Turkey", desc="Reported in Pakistani service."),
+                 _as(WINGLOONG2, "China", desc="Reported in Pakistani service.")),
+            _cty("UKR", _as(TB2, "Turkey", desc="Used by Ukraine since 2019, mostly early in the 2022 war.")),
+            _cty("POL", _as(TB2, "Turkey", desc="Polish Armed Forces, delivered from 2022.")),
+            _cty("GBR", _as(MQ9B, "United States", name="Protector RG1 (MQ-9B)", desc="Royal Air Force version of MQ-9B.")),
+            _cty("FRA", _as(MQ9, "United States", desc="French Air and Space Force; armed since 2019.")),
+            _cty("ITA", _as(MQ9, "United States", desc="Italian Air Force; cleared to be armed.")),
+            _cty("DEU", _sys("Heron TP", "Armed drone (medium altitude, long endurance)", "In service", "IAI Eitan",
+                             "Leased from Israel; the Bundestag approved arming it in 2022.",
+                             "Over 30 hours endurance; range not published", "Not published", maker="Israel Aerospace Industries",
+                             made_in="Israel")),
+            _cty("IND", _as(MQ9B, "United States", status="On order", desc="31 ordered from the US in 2024 for the Indian Navy, Army and Air Force.")),
+            _cty("SAU",
+                 _as(WINGLOONG2, "China", desc="Royal Saudi Air Force."),
+                 _as(AKINCI, "Turkey", status="On order", desc="Ordered in 2023, with part of production planned in Saudi Arabia.")),
+            _cty("ARE", _as(WINGLOONG2, "China", desc="UAE Air Force.")),
+            _cty("IDN", _as(CH4, "China", name="CH-4B", desc="Six bought; flown by Indonesian Air Force Squadron 51 from Supadio air base.")),
+            _cty("PRK",
+                 _sys("Saetbyol-9", "Armed drone (claimed)", "Claimed", "Saetbyol-9",
+                      "North Korean drone shown in 2023 that resembles the MQ-9; its capability is unverified.",
+                      "Not published", "Not published")),
+        ]},
+
+    "Loitering munitions": {
+        "group": "Strike", "short": "Loitering",
+        "blurb": "One-way attack drones that fly to an area, wait, and dive onto a target.",
+        "countries": [
+            _cty("ISR", HAROP, HARPY),
+            _cty("USA", SB600),
+            _cty("RUS",
+                 _sys("Lancet-3", "Loitering munition", "In service", "ZALA Lancet",
+                      "Russian loitering munition used widely against vehicles and artillery in Ukraine.",
+                      "About 40 to 70 km (reported)", "Not published", 40, "Lower reported figure", "ZALA Aero (Kalashnikov)"),
+                 _sys("Geran-2", "One-way attack drone", "In service", "HESA Shahed 136",
+                      "Russian-built version of Iran's Shahed-136, made in large numbers at Alabuga.",
+                      "About 2,000 km (reported)", "About 185 km/h (reported)", 2000, "Reported figure", "Alabuga (Russian production)")),
+            _cty("IRN", SHAHED136),
+            _cty("UKR",
+                 _sys("Lyutyi", "One-way attack drone", "In service", "AN-196 Liutyi",
+                      "Ukrainian long-range attack drone used against targets deep inside Russia.",
+                      "About 1,000 km or more (reported)", "Not published", 1000, "Reported figure", "Antonov"),
+                 _as(SB600, "United States", desc="Supplied by the US."),
+                 _as(WARMATE, "Poland", desc="Supplied by Poland.")),
+            _cty("POL", WARMATE),
+            _cty("TUR",
+                 _sys("Kargu-2", "Loitering munition (quadcopter)", "In service", "STM Kargu",
+                      "Small Turkish rotary-wing loitering munition.",
+                      "About 10 km (published)", "Not published", 10, "Published figure", "STM")),
+            _cty("IND",
+                 _as(HAROP, "Israel", desc="Indian Air Force; reported used in May 2025."),
+                 _sys("Nagastra-1", "Loitering munition", "In service", "Nagastra-1",
+                      "Indian-made small loitering munition, delivered to the Army from 2024.",
+                      "About 30 km (reported)", "Not published", 30, "Reported figure", "Solar Industries")),
+            _cty("KOR", _as(HARPY, "Israel", desc="Republic of Korea Army."), _as(HAROP, "Israel", desc="Republic of Korea Army.")),
+            _cty("TWN",
+                 _sys("Switchblade 300", "Loitering munition", "On order", "AeroVironment Switchblade",
+                      "Small US loitering munition ordered for Taiwan's army.",
+                      "About 10 km (published)", "Not published", 10, "Published figure", "AeroVironment", "United States")),
+        ]},
+
+    "Air-defence guns & C-RAM": {
+        "group": "Defence", "short": "AD guns & C-RAM",
+        "blurb": "Fast-firing guns against aircraft, drones and incoming rockets, artillery and mortar rounds (C-RAM).",
+        "countries": [
+            _cty("USA",
+                 _sys("Centurion C-RAM", "Counter-rocket, artillery and mortar gun", "In service", "Phalanx CIWS",
+                      "Land version of the Phalanx naval gun, used to protect bases.",
+                      "About 2 km (estimated)", NA, 2, "Estimated", "Raytheon (RTX)")),
+            _cty("DEU",
+                 _sys("Skyranger 30", "Self-propelled air-defence gun, 30 mm", "Fielding", "Skyranger 30",
+                      "German gun system on a Boxer vehicle, ordered mainly to counter drones.",
+                      "About 3 km (reported)", NA, 3, "Reported figure", "Rheinmetall")),
+            _cty("UKR",
+                 _as(GEPARD, "Germany", desc="Supplied by Germany since 2022; prized against Shahed drones."),
+                 _as(SKYNEX, "Germany", name="Skynex", desc="Supplied by Germany since 2023.")),
+            _cty("RUS",
+                 _sys("2K22 Tunguska", "Gun and missile air defence", "In service", "2K22 Tunguska",
+                      "Tracked vehicle with twin 30 mm guns and short-range missiles.",
+                      "Guns about 4 km; missiles about 8 km (reported)", NA, 8, "Missiles, reported", "KBP Instrument Design Bureau")),
+            _cty("CHN",
+                 _sys("PGZ-09", "Self-propelled air-defence gun, 35 mm", "In service", "PGZ-09",
+                      "Chinese twin 35 mm gun vehicle.", "About 4 km (reported)", NA, 4, "Reported figure", "Norinco")),
+            _cty("KOR",
+                 _sys("K30 Biho", "Self-propelled air-defence gun, 30 mm", "In service", "K30 Biho",
+                      "Twin 30 mm gun vehicle; the Biho II version adds short-range missiles.",
+                      "About 3 km (reported)", NA, 3, "Guns, reported", "Hanwha Aerospace")),
+            _cty("JPN",
+                 _sys("Type 87", "Self-propelled air-defence gun, 35 mm", "In service", "Type 87 self-propelled anti-aircraft gun",
+                      "Japanese twin 35 mm gun vehicle.", "About 3 km (reported)", NA, 3, "Reported figure",
+                      "Mitsubishi Heavy Industries and Japan Steel Works")),
+            _cty("TUR",
+                 _sys("Korkut", "Self-propelled air-defence gun, 35 mm", "In service", "Korkut",
+                      "Turkish tracked twin 35 mm gun vehicle firing airburst shells.",
+                      "About 4 km (reported)", NA, 4, "Reported figure", "Aselsan")),
+            _cty("IND",
+                 _sys("L70 (upgraded)", "Air-defence gun, 40 mm", "In service", "Bofors 40 mm L/70",
+                      "Swedish-designed 40 mm gun, upgraded in India and used against drones.",
+                      "About 4 km (reported)", NA, 4, "Reported figure", "Bofors; upgraded by Bharat Electronics", "Sweden")),
+            _cty("IDN", _as(SKYNEX, "Germany", name="Skyshield",
+                            desc="Indonesian Air Force; seven firing units as of 2025, used by the PASKHAS special forces to protect air bases.")),
+        ]},
+
+    "Counter-drone systems": {
+        "group": "Defence", "short": "Counter-drone",
+        "blurb": "Lasers, microwave weapons and jammers built to stop drones at short range.",
+        "countries": [
+            _cty("ISR",
+                 _sys("Iron Beam", "High-energy laser", "In service", "Iron Beam",
+                      "Israeli laser air defence against drones, rockets and mortars; entered service in 2025. Range drops in cloud or rain.",
+                      "About 7 to 10 km (reported)", "Speed of light", 10, "Upper reported figure", "Rafael with Elbit Systems"),
+                 _sys("Drone Dome", "Counter-drone system (jamming and laser)", "In service", "Drone Dome",
+                      "Israeli system that detects drones and jams or burns them.",
+                      "Not published", "Not published", maker="Rafael Advanced Defense Systems")),
+            _cty("GBR", _sys("Drone Dome", "Counter-drone system (jamming and laser)", "In service", "Drone Dome",
+                             "Bought from Israel by the British Army in 2018.", "Not published", "Not published",
+                             maker="Rafael Advanced Defense Systems", made_in="Israel")),
+            _cty("USA",
+                 _sys("Leonidas", "High-power microwave", "In service", "Epirus Leonidas",
+                      "US microwave weapon that can disable groups of drones at once.",
+                      "Short range; not published", "Speed of light", maker="Epirus")),
+            _cty("CHN",
+                 _sys("Silent Hunter", "High-energy laser", "In service", "Silent Hunter (laser)",
+                      "Chinese truck-mounted laser against drones.",
+                      "About 1 to 4 km (reported)", "Speed of light", 4, "Upper reported figure")),
+            _cty("KOR",
+                 _sys("Cheongwang", "High-energy laser", "In service", "Cheongwang (laser weapon)",
+                      "South Korean laser against small drones, deployed from 2024.",
+                      "Short range; not published", "Speed of light", maker="Hanwha Aerospace")),
+            _cty("TUR",
+                 _sys("İhtar", "Counter-drone system (radar, jamming)", "In service", "İhtar",
+                      "Turkish system that detects drones and jams their control links.",
+                      "Not published", "Not published", maker="Aselsan")),
+            _cty("IND",
+                 _sys("D4 system", "Counter-drone system (jamming and laser)", "In service", "Drone Detect, Deter and Destroy",
+                      "Indian system that detects, jams and can burn small drones.",
+                      "About 1 to 2 km for the laser (reported)", "Not published", 2, "Laser, upper reported figure", "DRDO")),
+            _cty("SGP",
+                 _sys("SAF Counter-UAS", "Counter-drone capability (sensors, jammers, weapons)", "In development",
+                      "Counter unmanned air system",
+                      "Counter-drone capability built up by the SAF's Counter-UAS Development and Operations group, announced in March 2025, "
+                      "to detect and stop small drones. The individual systems have not been named publicly.",
+                      "Not published", "Not published", maker="Singapore Armed Forces with DSTA")),
+            _cty("FRA",
+                 _sys("HELMA-P", "High-energy laser", "In service", "HELMA-P",
+                      "French laser against small drones, used to protect the 2024 Paris Olympics.",
+                      "About 1 km (reported)", "Speed of light", 1, "Reported figure", "CILAS")),
+        ]},
+
+    "Interceptor drones": {
+        "group": "Defence", "short": "Interceptor drones",
+        "blurb": "Drones built to fly into and destroy other drones.",
+        "countries": [
+            _cty("USA",
+                 COYOTE,
+                 _sys("Roadrunner-M", "Interceptor drone (reusable)", "In service", "Anduril Roadrunner",
+                      "Jet-powered interceptor that takes off vertically and can land again if not used.",
+                      "Not published", "Not published", maker="Anduril")),
+            _cty("UKR",
+                 _sys("Sting", "Interceptor drone", "In service", "Sting (drone)",
+                      "Ukrainian interceptor drone used against Shahed-type attack drones.",
+                      "Up to 25 km (maker's claim)", "Not published", 25, "Maker's claim", "Wild Hornets")),
+        ]},
+})
+
 for _cat in BATTLE_LAB.values():
     for _c in _cat["countries"]:
         for _s in _c["systems"]:
@@ -4105,6 +4603,11 @@ h1{margin:0;justify-self:end;font-family:var(--display);font-weight:700;font-siz
   background:rgb(227 179 74 / .1);color:var(--accent);font-family:var(--display);font-weight:700;font-size:.7rem;letter-spacing:.14em;text-transform:uppercase;white-space:nowrap;
   box-shadow:0 2px 0 rgb(0 0 0 / .6)}
 .pick.set{background:var(--accent);color:var(--accent-ink)}
+/* two pickers: strike (red, like its rings) and defence (blue); filled = the one being browsed */
+.pick.strike{border-color:#f06050;background:rgb(224 72 60 / .12);color:#f6a493}
+.pick.defence{border-color:#78aaff;background:rgb(80 140 240 / .12);color:#a9c8ff}
+.pick.strike.set{background:#e0483c;border-color:#f06050;color:#fff}
+.pick.defence.set{background:#3f7be0;border-color:#78aaff;color:#fff}
 .pick:active{transform:translateY(2px);box-shadow:none}
 .pick svg{width:10px;height:10px;fill:none;stroke:currentColor;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
 .ctrl{display:flex;flex-wrap:wrap;align-items:center;gap:8px;min-width:0}
@@ -4296,7 +4799,9 @@ dialog::backdrop{background:rgb(0 0 0 / .55)}
 <header class="bar" id="bar">
   <a class="back" href="/" aria-label="Home">&larr;<span class="bk"> Home</span></a>
   <div class="ctrl">
-    <button class="pick" id="pick" type="button" aria-haspopup="dialog"><span id="pickt">Choose your Weapon</span>
+    <button class="pick strike" id="pickS" type="button" aria-haspopup="dialog"><span class="pt">Choose your Strike</span>
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 6l5 5 5-5"/></svg></button>
+    <button class="pick defence" id="pickD" type="button" aria-haspopup="dialog"><span class="pt">Choose your Defence</span>
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 6l5 5 5-5"/></svg></button>
     <button class="launch" id="launch" type="button" aria-pressed="false" hidden>
       <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5"/><path d="M8 1v3M8 12v3M1 8h3M12 8h3"/></svg>
@@ -4332,8 +4837,8 @@ dialog::backdrop{background:rgb(0 0 0 / .55)}
 </aside>
 
 <dialog id="dlg" aria-labelledby="dh">
-  <p class="dh" id="dh">Choose your Weapon</p>
-  <p class="ds">Pick a weapon type to see who has it.</p>
+  <p class="dh" id="dh">Choose your Strike</p>
+  <p class="ds" id="ds">Pick a weapon type to see who has it.</p>
   <div class="opts" id="opts"></div>
   <p class="soon">Each country lists the systems it has, made locally or bought. Launchers are placed on land inside that country.</p>
 </dialog>
@@ -4745,6 +5250,7 @@ function renderChips() {
     chip.append(show, x); box.append(chip);
   });
   box.hidden = !box.childElementCount;
+  updatePickers();
   syncBar();
 }
 
@@ -4753,10 +5259,9 @@ function showSlot(g) {
   if (placing) setPlacing(false);
   if (mode !== sl.cat) {
     mode = sl.cat;
-    $('#pickt').textContent = DATA[mode].short;
-    $('#pick').classList.add('set');
     $('#roster').hidden = false;
   }
+  updatePickers();
   selIso = sl.c.iso; selSys = sl.s;
   renderRoster(); paint();
   $('#rl').scrollTop = 0;
@@ -4831,8 +5336,7 @@ function pickSystem(c, s) {
 function setMode(m) {
   if (placing) setPlacing(false);
   mode = m; selIso = null; selSys = null;   // systems already on the map stay there
-  $('#pickt').textContent = DATA[m].short;
-  $('#pick').classList.add('set');
+  updatePickers();
   $('#roster').hidden = false;
   setSheet(true);
   renderRoster(); paint();
@@ -4849,10 +5353,23 @@ var ICONS = {
             ['rect', { x: '15', y: '27', width: '10', height: '6', rx: '1', fill: '#cbbd92', stroke: '#000', 'stroke-width': '1' }]]
 };
 
-function openPicker() {
+// Two pickers, one per group. Each button shows the category chosen in its group (the one being
+// browsed, or the one whose system is on the map); the filled button is the group being browsed.
+var PICK = { Strike: { btn: '#pickS', label: 'Choose your Strike', note: 'Pick a strike weapon type to see who has it. Strike ranges show as red rings.' },
+             Defence: { btn: '#pickD', label: 'Choose your Defence', note: 'Pick a defence system type to see who has it. Defence ranges show as blue rings.' } };
+function updatePickers() {
+  ['Strike', 'Defence'].forEach(function (g) {
+    var b = $(PICK[g].btn), browsing = !!mode && grpOf(mode) === g;
+    var cat = browsing ? mode : (slots[g] ? slots[g].cat : null);
+    b.querySelector('.pt').textContent = cat ? DATA[cat].short : PICK[g].label;
+    b.classList.toggle('set', browsing);
+    b.setAttribute('aria-label', PICK[g].label + (cat ? ': ' + cat : ''));
+  });
+}
+function openPicker(grp) {
   var box = $('#opts'); box.replaceChildren();
-  ['Strike', 'Defence'].forEach(function (grp) {
-    box.append(el('p', grp === 'Strike' ? 'Strike · red rings' : 'Defence · blue rings', 'grp ' + (grp === 'Strike' ? 'off' : 'def')));
+  $('#dh').textContent = PICK[grp].label; $('#ds').textContent = PICK[grp].note;
+  [grp].forEach(function (grp) {
     Object.keys(DATA).filter(function (k) { return DATA[k].group === grp; }).forEach(function (k) {
       var b = el('button', null, 'opt'); b.type = 'button';
       b.setAttribute('aria-pressed', String(k === mode));
@@ -4868,7 +5385,8 @@ function openPicker() {
   });
   $('#dlg').showModal();
 }
-$('#pick').onclick = openPicker;
+$('#pickS').onclick = function () { openPicker('Strike'); };
+$('#pickD').onclick = function () { openPicker('Defence'); };
 $('#dlg').addEventListener('click', function (e) { if (e.target === this) this.close(); });
 $('#rh').onclick = function () {
   if (!phone()) return;
@@ -4900,7 +5418,7 @@ if (!window.d3 || !window.topojson) {
   d3.json(WORLD_URL).then(function (world) {
     features = topojson.feature(world, world.objects.countries).features.filter(function (f) { return f.properties.name !== 'Antarctica'; });
     syncBar(); build();
-    if (mode) $('#msg').hidden = true; else showMsg('Tap “Choose your Weapon” to begin.');
+    if (mode) $('#msg').hidden = true; else showMsg('Tap “Choose your Strike” or “Choose your Defence” to begin.');
     // Rebuild when the window changes size (rotation, resizing). Small height changes from the
     // phone's address bar sliding are ignored so the map does not jump while you pan.
     var timer;
@@ -4920,7 +5438,7 @@ BATTLE_HTML = BATTLE_PAGE.replace("__BATTLE_DATA__", json.dumps(BATTLE_LAB).repl
 
 
 HOME = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Guided Weapons University</title>
+<title>GW University</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Jost:wght@500;700&family=Zilla+Slab:ital,wght@0,400;0,600;1,400&display=swap">
@@ -5032,9 +5550,9 @@ body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--body);over
       <path d="M60 104c-8-5-18-6-26-4v18c8-2 18-1 26 4 8-5 18-6 26-4v-18c-8-2-18-1-26 4zM60 104v18" fill="none" stroke="#cbbd92" stroke-width="2" stroke-linejoin="round"/>
     </svg>
     <div class="welcome">
-      <p class="inst"><b>ASPC-GW</b> · Guided Weapons University</p>
-      <h1>Welcome to the Guided Weapons University</h1>
-      <p class="lede">An academic space for our engineers to explore, learn and experiment with public information on guided weapons. Choose an app to begin.</p>
+      <p class="inst"><b>ASPC-GW</b> · GW University</p>
+      <h1>Welcome to GW University</h1>
+      <p class="lede">An academic space for our engineers to explore, learn and experiment with public information. Choose an app to begin.</p>
     </div>
   </header>
 
@@ -5081,7 +5599,7 @@ body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--body);over
       <span class="txt">
         <span class="tag">Daily</span>
         <span class="name">Top 10 News</span>
-        <span class="desc">Today's top 10 stories by topic, starting with hypersonic weapons, each with a photo and a short summary.</span>
+        <span class="desc">The 10 latest top stories for each topic, each with a photo and a short summary.</span>
         <span class="go">Enter <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 1l9 5-9 5z"/></svg></span>
       </span>
     </a>
@@ -5232,8 +5750,10 @@ h1{margin:0;font-family:var(--display);font-weight:700;font-size:clamp(1.8rem,5v
 .legend i{display:inline-block;width:10px;height:10px;border-radius:50%}
 .legend .k-other{background:#7d8c86}
 .legend .k-match{background:#e3b34a}
-.legend .k-you{width:14px;height:14px;border-radius:0;background:linear-gradient(#9fc3ff,#9fc3ff) 50% 0 / 2px 100% no-repeat,linear-gradient(#9fc3ff,#9fc3ff) 0 50% / 100% 2px no-repeat}
+.legend .k-you{width:6px;height:14px;border-radius:0;background:linear-gradient(#9fc3ff,#9fc3ff) 50% 0 / 2px 100% no-repeat}
 .chart{position:relative;min-width:0}
+.land .lh3{margin:18px 0 0;font-family:var(--display);font-weight:700;font-size:.78rem;letter-spacing:.18em;text-transform:uppercase;color:var(--ink)}
+.land .lsub2{margin:2px 0 4px;color:var(--muted);font-size:.86rem}
 .chart svg{display:block;width:100%;height:auto;overflow:visible}
 .chart .gl{stroke:#2a3740;stroke-width:1}
 .chart .ref{stroke:#4d5d66;stroke-width:1;stroke-dasharray:4 4}
@@ -5302,9 +5822,14 @@ h1{margin:0;font-family:var(--display);font-weight:700;font-size:clamp(1.8rem,5v
       <div class="legend">
         <span><i class="k-other"></i>Other published systems</span>
         <span><i class="k-match"></i>Your closest matches (numbered)</span>
-        <span><i class="k-you"></i>Your parameters</span>
+        <span><i class="k-you"></i>Your value</span>
       </div>
-      <div class="chart" id="chart"></div>
+      <h3 class="lh3">Range</h3>
+      <p class="lsub2" id="rsub"></p>
+      <div class="chart" id="chart-r"></div>
+      <h3 class="lh3">Speed</h3>
+      <p class="lsub2" id="ssub"></p>
+      <div class="chart" id="chart-s"></div>
       <details class="ltable"><summary>Show as a table</summary><div id="ltable"></div></details>
     </section>
     <p class="foot">Specifications come from Wikipedia infoboxes and are published figures, so they may be incomplete, rounded or disputed. Only systems with a Wikipedia infobox are searched. Text and images are available under CC BY-SA licences; open each article for full credits.</p>
@@ -5473,62 +5998,88 @@ function loadLandscape() {
 }
 
 function drawLandscape() {
-  var box = $('#chart'), sec = $('#land');
   if (!LAND) return;
   var pts = LAND.points, rank = {};
   matches.forEach(function (m) { rank[m.title] = m.rank; });
-  var yourKm = parseFloat(lastQ && lastQ.get('range')) || null, yourMach = parseFloat(lastQ && lastQ.get('speed')) || null;
   var what = LAND.type ? LAND.type.toLowerCase() + 's' : 'systems across all types';
-  $('#lsub').textContent = pts.length + ' ' + what + ' publish both a range and a speed' +
-    (LAND.without ? '; ' + LAND.without + ' others publish only one or neither, so they are not shown' : '') + '. Both axes use a log scale.';
-  sec.hidden = false;
-  box.replaceChildren();
-  if (!pts.length) { box.append(el('p', 'No systems of this type publish both a range and a speed.', 'cov')); $('#ltable').replaceChildren(); return; }
+  var withR = pts.filter(function (p) { return p.km; }), withS = pts.filter(function (p) { return p.mach; });
+  $('#lsub').textContent = 'Every ' + (LAND.type ? LAND.type.toLowerCase() : 'system') + ' that publishes the figure, out of ' +
+    LAND.total + ' ' + what + ' found. Each dot is one system; both scales are logarithmic.';
+  $('#land').hidden = false;
+  drawStrip($('#chart-r'), $('#rsub'), withR, rank, {
+    val: function (p) { return p.km; }, you: parseFloat(lastQ && lastQ.get('range')) || null,
+    fmt: function (v) { return fmtKm(v) + ' km'; }, tick: fmtKm, axis: 'Range (km)', floor: 0.5, refs: [],
+    count: withR.length + ' of ' + LAND.total + ' publish a range' });
+  drawStrip($('#chart-s'), $('#ssub'), withS, rank, {
+    val: function (p) { return p.mach; }, you: parseFloat(lastQ && lastQ.get('speed')) || null,
+    fmt: function (v) { return 'Mach ' + fmtMach(v); }, tick: fmtMach, axis: 'Speed (Mach)', floor: 0.05,
+    refs: [[1, 'Speed of sound', 'Mach 1'], [5, 'Hypersonic (Mach 5)', 'Mach 5']],
+    count: withS.length + ' of ' + LAND.total + ' publish a speed' });
 
-  var kms = pts.map(function (p) { return p.km; }).concat(yourKm ? [yourKm] : []);
-  var machs = pts.map(function (p) { return p.mach; }).concat(yourMach ? [yourMach] : []);
-  var xlo = Math.max(0.5, Math.min.apply(null, kms) * 0.7), xhi = Math.max.apply(null, kms) * 1.4;
-  var ylo = Math.max(0.05, Math.min.apply(null, machs) * 0.8), yhi = Math.max.apply(null, machs) * 1.25;
-  var W = Math.max(280, box.clientWidth), H = Math.round(Math.min(440, Math.max(260, W * 0.55)));
-  var m = { l: 46, r: 16, t: 16, b: 42 }, pw = W - m.l - m.r, ph = H - m.t - m.b;
-  function X(v) { return m.l + Math.log(v / xlo) / Math.log(xhi / xlo) * pw; }
-  function Y(v) { return m.t + ph - Math.log(v / ylo) / Math.log(yhi / ylo) * ph; }
+  var tbl = el('table'), hd = el('tr');
+  ['System', 'Range (km)', 'Speed (Mach)'].forEach(function (h, i) { var th = el('th', h); if (i) th.style.textAlign = 'right'; hd.append(th); });
+  tbl.append(hd);
+  pts.slice().sort(function (a, b) { return (b.km || 0) - (a.km || 0) || (b.mach || 0) - (a.mach || 0); }).forEach(function (p) {
+    var tr = el('tr', null, rank[p.title] ? 'm' : ''), td = el('td');
+    var u = safeUrl(p.url), nm = (rank[p.title] ? '#' + rank[p.title] + ' ' : '') + p.title;
+    if (u) { var a = el('a', nm); a.href = u; a.target = '_blank'; a.rel = 'noopener'; a.style.color = 'inherit'; td.append(a); } else td.textContent = nm;
+    tr.append(td, el('td', p.km ? fmtKm(p.km) : '—', 'n'), el('td', p.mach ? fmtMach(p.mach) : '—', 'n'));
+    tbl.append(tr);
+  });
+  $('#ltable').replaceChildren(tbl);
+}
+
+/* One dot per system along a log scale. Dots that would overlap are stacked above and below the
+   centre line (a simple beeswarm), so every system stays visible and can be hovered. */
+function drawStrip(box, sub, pts, rank, o) {
+  box.replaceChildren();
+  sub.textContent = o.count + '.';
+  if (!pts.length) { box.append(el('p', 'None of these systems publish this figure.', 'cov')); return; }
+  var vals = pts.map(o.val).concat(o.you ? [o.you] : []);
+  var lo = Math.max(o.floor, Math.min.apply(null, vals) * 0.7), hi = Math.max.apply(null, vals) * 1.4;
+  // top margin holds up to two label rows: reference lines (upper) and your value (lower)
+  var W = Math.max(280, box.clientWidth), m = { l: 16, r: 16, t: o.refs.length && o.you ? 40 : 26, b: 40 }, pw = W - m.l - m.r;
+  function X(v) { return m.l + Math.log(v / lo) / Math.log(hi / lo) * pw; }
+
+  // place dots: sorted by position, each takes the nearest free row to the centre line
+  var R = 4, gap = 2 * R + 1, rows = {}, placed = [];
+  pts.slice().sort(function (a, b) { return o.val(a) - o.val(b); }).forEach(function (p) {
+    var x = X(o.val(p)), k = 0;
+    for (var i = 0; i < 400; i++) {
+      k = i === 0 ? 0 : (i % 2 ? (i + 1) / 2 : -i / 2);
+      if (rows[k] == null || x - rows[k] >= gap) break;
+    }
+    rows[k] = x;
+    placed.push({ p: p, x: x, k: k });
+  });
+  var kmax = Math.max.apply(null, placed.map(function (d) { return Math.abs(d.k); }));
+  var ph = Math.max(60, (2 * kmax + 1) * gap + 12), H = m.t + ph + m.b, mid = m.t + ph / 2;
 
   var svg = sv('svg', { viewBox: '0 0 ' + W + ' ' + H, role: 'img',
-    'aria-label': 'Scatter chart of range against speed for ' + pts.length + ' ' + what + '. A table version is below.' });
-  logTicks(xlo, xhi).forEach(function (v) {
-    svg.append(sv('line', { 'class': 'gl', x1: X(v), x2: X(v), y1: m.t, y2: m.t + ph }), sv('text', { 'class': 'tk', x: X(v), y: m.t + ph + 16, 'text-anchor': 'middle' }, fmtKm(v)));
+    'aria-label': o.axis + ' of ' + pts.length + ' systems, one dot each. A table version is below.' });
+  logTicks(lo, hi).forEach(function (v) {
+    svg.append(sv('line', { 'class': 'gl', x1: X(v), x2: X(v), y1: m.t, y2: m.t + ph }),
+               sv('text', { 'class': 'tk', x: X(v), y: m.t + ph + 16, 'text-anchor': 'middle' }, o.tick(v)));
   });
-  logTicks(ylo, yhi).forEach(function (v) {
-    svg.append(sv('line', { 'class': 'gl', x1: m.l, x2: m.l + pw, y1: Y(v), y2: Y(v) }), sv('text', { 'class': 'tk', x: m.l - 6, y: Y(v) + 4, 'text-anchor': 'end' }, fmtMach(v)));
+  var labels = [];   // drawn after the dots so they stay readable
+  o.refs.forEach(function (r) {
+    if (r[0] <= lo || r[0] >= hi) return;
+    svg.append(sv('line', { 'class': 'ref', x1: X(r[0]), x2: X(r[0]), y1: m.t - (o.you ? 18 : 4), y2: m.t + ph }));
+    var near = X(r[0]) > W - 140;   // keep labels near the right edge inside the chart
+    labels.push(sv('text', { 'class': 'reft', x: X(r[0]) + (near ? -4 : 4), y: m.t - (o.you ? 22 : 8), 'text-anchor': near ? 'end' : 'start' },
+                   W < 560 ? r[2] : r[1]));   // short labels on phones so they don't collide
   });
-  var refLabels = [];   // drawn after the dots so they stay readable
-  [[1, 'Speed of sound'], [5, 'Hypersonic (Mach 5)']].forEach(function (r) {   // reference lines
-    if (r[0] <= ylo || r[0] >= yhi) return;
-    svg.append(sv('line', { 'class': 'ref', x1: m.l, x2: m.l + pw, y1: Y(r[0]), y2: Y(r[0]) }));
-    refLabels.push(sv('text', { 'class': 'reft', x: m.l + pw - 4, y: Y(r[0]) - 4, 'text-anchor': 'end' }, r[1]));
-  });
-  svg.append(sv('text', { 'class': 'at', x: m.l + pw / 2, y: H - 4, 'text-anchor': 'middle' }, 'Range (km)'),
-             sv('text', { 'class': 'at', x: 12, y: m.t + ph / 2, 'text-anchor': 'middle', transform: 'rotate(-90 12 ' + (m.t + ph / 2) + ')' }, 'Speed (Mach)'));
-
-  if (yourKm || yourMach) {   // your parameters: a crosshair (or a single line if you entered only one)
-    var g = sv('g', {});
-    if (yourKm) g.append(sv('line', { 'class': 'you', x1: X(yourKm), x2: X(yourKm), y1: m.t, y2: m.t + ph }));
-    if (yourMach) g.append(sv('line', { 'class': 'you', x1: m.l, x2: m.l + pw, y1: Y(yourMach), y2: Y(yourMach) }));
-    if (yourKm && yourMach) {
-      var cx = X(yourKm), cy = Y(yourMach);
-      g.append(sv('path', { 'class': 'youm', d: 'M' + cx + ' ' + (cy - 7) + 'L' + (cx + 7) + ' ' + cy + 'L' + cx + ' ' + (cy + 7) + 'L' + (cx - 7) + ' ' + cy + 'Z' }),
-               sv('text', { 'class': 'youl', x: cx + 10, y: cy - 9 }, 'You'));
-    } else {
-      g.append(sv('text', { 'class': 'youl', x: yourKm ? X(yourKm) + 5 : m.l + 4, y: yourKm ? m.t + 12 : Y(yourMach) - 5 }, 'You'));
-    }
-    svg.append(g);
+  svg.append(sv('text', { 'class': 'at', x: m.l + pw / 2, y: H - 4, 'text-anchor': 'middle' }, o.axis));
+  if (o.you) {
+    svg.append(sv('line', { 'class': 'you', x1: X(o.you), x2: X(o.you), y1: m.t - 4, y2: m.t + ph }));
+    labels.push(sv('text', { 'class': 'youl', x: X(o.you) + 5, y: m.t - 8, 'text-anchor': X(o.you) > W - 70 ? 'end' : 'start' },
+                   'You: ' + o.fmt(o.you)));
   }
 
   var tip = el('div', null, 'tip'); tip.hidden = true;
   function show(p, cx, cy, pin) {
     tip.replaceChildren(el('b', (rank[p.title] ? '#' + rank[p.title] + ' ' : '') + p.title),
-                        el('span', 'Range about ' + fmtKm(p.km) + ' km · Mach ' + fmtMach(p.mach)));
+                        el('span', [p.km ? 'Range about ' + fmtKm(p.km) + ' km' : '', p.mach ? 'Mach ' + fmtMach(p.mach) : ''].filter(Boolean).join(' · ')));
     var u = safeUrl(p.url);
     if (u) { var a = el('a', 'Read on Wikipedia ↗'); a.href = u; a.target = '_blank'; a.rel = 'noopener'; tip.append(document.createElement('br'), a); }
     tip.hidden = false;
@@ -5536,32 +6087,20 @@ function drawLandscape() {
     tip.style.left = Math.max(0, left) + 'px'; tip.style.top = Math.max(0, cy - 14) + 'px';
     pinned = pin ? p : null;
   }
-  var ordered = pts.slice().sort(function (a, b) { return (rank[a.title] ? 1 : 0) - (rank[b.title] ? 1 : 0); });   // matches on top
-  ordered.forEach(function (p) {
-    var cx = X(p.km), cy = Y(p.mach), r = rank[p.title];
-    var hit = sv('circle', { 'class': 'hit', cx: cx, cy: cy, r: 11 });
-    var dot = sv('circle', { 'class': 'dot ' + (r ? 'd-match' : 'd-other'), cx: cx, cy: cy, r: r ? 6 : 4 });
+  placed.sort(function (a, b) { return (rank[a.p.title] ? 1 : 0) - (rank[b.p.title] ? 1 : 0); });   // matches on top
+  placed.forEach(function (d) {
+    var p = d.p, cx = d.x, cy = mid + d.k * gap, r = rank[p.title];
+    var hit = sv('circle', { 'class': 'hit', cx: cx, cy: cy, r: 9 });
+    var dot = sv('circle', { 'class': 'dot ' + (r ? 'd-match' : 'd-other'), cx: cx, cy: cy, r: r ? 6 : R });
     hit.addEventListener('mouseenter', function () { if (!pinned) show(p, cx, cy, false); });
     hit.addEventListener('mouseleave', function () { if (!pinned) tip.hidden = true; });
     hit.addEventListener('click', function (e) { e.stopPropagation(); show(p, cx, cy, true); });
     svg.append(hit, dot);
-    if (r) svg.append(sv('text', { 'class': 'rkl', x: cx + 8, y: cy - 7 }, String(r)));
+    if (r) labels.push(sv('text', { 'class': 'rkl', x: cx + 7, y: cy - 6 }, String(r)));
   });
-  refLabels.forEach(function (t) { t.style.pointerEvents = 'none'; svg.append(t); });
+  labels.forEach(function (t) { t.style.pointerEvents = 'none'; svg.append(t); });
   box.onclick = function () { pinned = null; tip.hidden = true; };   // tap elsewhere to close a pinned tooltip
   box.append(svg, tip);
-
-  var tbl = el('table'), hd = el('tr');
-  ['System', 'Range (km)', 'Speed (Mach)'].forEach(function (h, i) { var th = el('th', h); if (i) th.style.textAlign = 'right'; hd.append(th); });
-  tbl.append(hd);
-  pts.slice().sort(function (a, b) { return b.km - a.km; }).forEach(function (p) {
-    var tr = el('tr', null, rank[p.title] ? 'm' : ''), td = el('td');
-    var u = safeUrl(p.url), nm = (rank[p.title] ? '#' + rank[p.title] + ' ' : '') + p.title;
-    if (u) { var a = el('a', nm); a.href = u; a.target = '_blank'; a.rel = 'noopener'; a.style.color = 'inherit'; td.append(a); } else td.textContent = nm;
-    tr.append(td, el('td', fmtKm(p.km), 'n'), el('td', fmtMach(p.mach), 'n'));
-    tbl.append(tr);
-  });
-  $('#ltable').replaceChildren(tbl);
 }
 var landTimer;
 window.addEventListener('resize', function () { clearTimeout(landTimer); landTimer = setTimeout(drawLandscape, 200); });

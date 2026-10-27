@@ -1,6 +1,6 @@
-# Guided Weapons University (GW Dashboard)
+# GW University (GW Dashboard)
 
-A Flask app for engineers who follow public information on guided weapons.
+A Flask app for engineers who follow public defence information.
 Everything is in `app.py`; Python packages are in `requirements.txt`.
 Live on Render: https://gw-dashboard-slvo.onrender.com
 
@@ -8,10 +8,10 @@ Live on Render: https://gw-dashboard-slvo.onrender.com
 
 | Page | Route | What it does |
 |---|---|---|
-| Home | `/` | Dark "Welcome to the Guided Weapons University" page with the ASPC-GW crest and links to each app. |
+| Home | `/` | Dark "Welcome to GW University" page with the ASPC-GW crest and links to each app. |
 | Battle Lab | `/battle-lab` | Visual map of publicly reported systems by country and category. You can place a strike and a defence launcher inside the operating country and show their published range rings. It does not simulate engagements or intercepts. |
-| Top 10 News | `/trends` | Four topic buttons (Hypersonic, Air & Missile Defence, Ballistic Missiles, Drones & Loitering Munitions). Each shows that day's top 10 stories as cards, each with a 3-line summary taken from the article. Updates once a day at 6am only. |
-| Market Research | `/research` | Finds systems of a type whose published specifications are closest to the range, speed and warhead you enter, using Wikipedia infoboxes. Also shows a "Market landscape" chart of range against speed, and **Export** downloads the matches on screen as Excel (.xlsx) or, for Google Sheets, CSV (one column per system, a photo row, 12 specification rows, "Information Not Found" where the source doesn't state it). |
+| Top 10 News | `/trends` | Four topic buttons (Hypersonic, Air & Missile Defence, Ballistic Missiles, Drones & Loitering Munitions). Each shows 10 stories as cards, each with a 3-line summary taken from the article: the 6am update's stories first, topped up with the newest stories from earlier days (up to 20 days old) when there are fewer than 10. Updates once a day at 6am only. |
+| Market Research | `/research` | Finds systems of a type whose published specifications are closest to the range, speed and warhead you enter, using Wikipedia infoboxes. Also shows a "Market landscape": one chart of range and one of speed, each with every system that publishes that figure, and **Export** downloads the matches on screen as Excel (.xlsx) or, for Google Sheets, CSV (one column per system, a photo row, 12 specification rows, "Information Not Found" where the source doesn't state it). |
 | Standards Library | `/standards` | Free, publicly released DoD and NASA standards, each with a link to the official copy. Most have **Ask this standard**: a keyword search inside the document that shows the best-matching passages word for word with their PDF page. Munition & fuze safety standards are listed as reference only (no overview, no search). |
 
 ## Ground rules
