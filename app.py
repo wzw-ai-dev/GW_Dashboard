@@ -6039,7 +6039,7 @@ body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--body);over
     </svg>
     <div class="welcome">
       <p class="inst"><b>ASPC-GW</b> · GW University</p>
-      <h1>Welcome to GW University</h1>
+      <h1>Welcome to ATLAS</h1>
       <p class="lede">An academic space for our engineers to explore, learn and experiment with public information. Choose an app to begin.</p>
     </div>
   </header>
