@@ -2577,7 +2577,14 @@ def _terms(text):
 
 
 def std_index_path(num):
-    return os.path.join(STD_INDEX_DIR, std_key(num) + ".json.gz")
+    """standards_index/<NUMBER>.json.gz, or the same file next to app.py (easier to upload on GitHub's website)."""
+    name = std_key(num) + ".json.gz"
+    path = os.path.join(STD_INDEX_DIR, name)
+    if not os.path.exists(path):
+        beside = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+        if os.path.exists(beside):
+            return beside
+    return path
 
 
 def std_has_search(num):
