@@ -1661,11 +1661,22 @@ def research_export():
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow(["Specification"] + ["#%d %s" % (i, r["title"]) for i, r in enumerate(results, start=1)])
-        # The only formula we write ourselves: Google Sheets shows the photo from its Wikimedia link.
-        w.writerow(["Photo"] + ['=IMAGE("%s")' % u if u and '"' not in u else NOT_FOUND for u in photos])
+        # The only formula we write ourselves: the photo, shown from its Wikimedia link. The link sits in its own
+        # "Photo link" row and the formula just points at that cell (=IMAGE(B16)): a formula with quote marks
+        # inside has to be quoted in a CSV, and spreadsheets then tend to import it as plain text.
+        link_row = 2 + len(EXPORT_ROWS) + 2          # header, photo, the spec rows, source, then this row
+        def col(n):                                   # 1 -> A, 2 -> B, ... 27 -> AA
+            s = ""
+            while n:
+                n, r = divmod(n - 1, 26)
+                s = chr(65 + r) + s
+            return s
+        w.writerow(["Photo"] + ["=IMAGE(%s%d)" % (col(i), link_row) if u else NOT_FOUND
+                                for i, u in enumerate(photos, start=2)])
         for i, label in enumerate(EXPORT_ROWS):
             w.writerow([label] + [safe(c[i]) for c in columns])
         w.writerow(["Source"] + [r["url"] for r in results])
+        w.writerow(["Photo link"] + [u or NOT_FOUND for u in photos])
         w.writerow([])
         for line in notes:
             w.writerow([line])
@@ -6290,7 +6301,7 @@ h1{margin:0;font-family:var(--display);font-weight:700;font-size:clamp(1.8rem,5v
     <div class="more" id="more" hidden><button class="btn" id="mb" type="button">Show next 5 matches</button><div class="xwrap"><button class="btn alt" id="xl" type="button" aria-expanded="false" aria-controls="xmenu">Export</button>
       <div class="xmenu" id="xmenu" hidden>
         <button type="button" data-fmt="xlsx"><b>Excel</b><span>.xlsx · opens in Excel</span></button>
-        <button type="button" data-fmt="csv"><b>Google Sheets</b><span>.csv · in Sheets: File › Import › Upload</span></button>
+        <button type="button" data-fmt="csv"><b>Google Sheets</b><span>.csv · File › Import › Upload, and tick “Convert text to numbers, dates, and formulas” for photos</span></button>
       </div></div></div>
 
     <section class="land" id="land" hidden aria-labelledby="lh">
