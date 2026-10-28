@@ -59,7 +59,7 @@ NEWS_TOPICS = {
                  "iron dome", "golden dome", "patriot missile", "patriot system", "patriot batter", "s-400",
                  "arrow 3", "david's sling", "nasams", "iris-t", "sm-6", "sm-3", "samp/t", "aster 30"],
         "context": _MIL,
-        "exclude": ["nfl", "touchdown", "quarterback", "football"],
+        "exclude": ["nfl", "touchdown", "quarterback", "football", "police interceptor", "crown victoria"],
     },
     "Ballistic Missiles": {
         "queries": ['"ballistic missile" OR ICBM OR IRBM OR "missile launch"',
@@ -68,7 +68,7 @@ NEWS_TOPICS = {
         "must": ["ballistic missile", "icbm", "irbm", "srbm", "mrbm", "missile launch", "missile test",
                  "hwasong", "iskander", "oreshnik", "df-21", "df-26", "df-41", "fateh", "kheibar", "shaheen", "agni"],
         "context": _MIL,
-        "exclude": [],
+        "exclude": ["iskander mirza", "daily quiz"],
     },
     "Drones & Loitering Munitions": {
         "queries": ['"loitering munition" OR "kamikaze drone" OR "one-way attack drone" OR "attack drone"',
@@ -117,14 +117,22 @@ _gdelt_gate, _gdelt_last = threading.Lock(), [0.0]
 
 
 def fetch_gdelt(query):
-    with _gdelt_gate:   # GDELT blocks bursts (HTTP 429): keep searches at least 6 seconds apart
-        gap = 6 - (time.time() - _gdelt_last[0])
-        if gap > 0:
-            time.sleep(gap)
-        _gdelt_last[0] = time.time()
-    data = http_json("https://api.gdeltproject.org/api/v2/doc/doc?" + urlencode({
-        "query": query, "mode": "artlist", "maxrecords": "50",
-        "format": "json", "sort": "datedesc", "timespan": "%dd" % NEWS_MAX_AGE_DAYS}))
+    url = "https://api.gdeltproject.org/api/v2/doc/doc?" + urlencode({
+        "query": query, "mode": "artlist", "maxrecords": "75",
+        "format": "json", "sort": "datedesc", "timespan": "%dd" % NEWS_MAX_AGE_DAYS})
+    for n in range(3):   # GDELT is free but often busy (HTTP 429) or slow: try up to three times
+        with _gdelt_gate:   # GDELT blocks bursts: keep searches at least 6 seconds apart
+            gap = 6 - (time.time() - _gdelt_last[0])
+            if gap > 0:
+                time.sleep(gap)
+            _gdelt_last[0] = time.time()
+        try:
+            data = http_json(url)
+            break
+        except Exception:
+            if n == 2:
+                raise
+            time.sleep(15 * (n + 1))
     out = []
     for a in data.get("articles") or []:
         try:
@@ -329,13 +337,13 @@ def collect_top(topic):
                 steps.append(dict(step, topic=topic))
         if articles:
             used = "NewsData.io"
-    # NewsData's free plan only covers about two days; when that gives few stories, GDELT adds the last few weeks
-    if len(articles) < TOP_N * 3:
-        more, step = attempt("GDELT", fetch_gdelt, cfg["gdelt"])
-        steps.append(dict(step, topic=topic))
-        if more:
-            articles += more
-            used = used + " + GDELT" if used else "GDELT"
+    # NewsData's free plan only covers about two days; GDELT adds the last few weeks, so there are always
+    # older stories to fill the top 10 when the last day has few
+    more, step = attempt("GDELT", fetch_gdelt, cfg["gdelt"])
+    steps.append(dict(step, topic=topic))
+    if more:
+        articles += more
+        used = used + " + GDELT" if used else "GDELT"
 
     seen = {}
     for a in articles:
@@ -350,9 +358,11 @@ def collect_top(topic):
                 seen[key]["image"] = a["image"]
             continue
         seen[key] = {**a, "desc": a["desc"].strip(), "hits": 1}
-    # more candidates than needed: the weapons/military check needs the article text (GDELT gives headlines only)
-    ranked = sorted(seen.values(),
-                    key=lambda i: i["hits"] * 24 - (now - i["ts"]) / 3600, reverse=True)[:TOP_N * 2]
+    # Many more candidates than needed: the weapons/military check needs the article text (GDELT gives
+    # headlines only), and summarise_top keeps reading down this list until it has TOP_N stories.
+    cutoff = now - NEWS_MAX_AGE_DAYS * 86400
+    ranked = sorted((i for i in seen.values() if i["ts"] >= cutoff),
+                    key=lambda i: i["hits"] * 24 - (now - i["ts"]) / 3600, reverse=True)[:TOP_N * 6]
     return ranked, steps, used
 
 
@@ -567,19 +577,30 @@ def read_page(url):
     return _pages[url]
 
 
+FRESH_HOURS = 24   # stories newer than this lead the top 10; older ones fill the rest, newest first
+
+
 def summarise_top(candidates, cfg):
-    """Read the candidates' articles, keep the ones really about the topic, and summarise the top 10."""
+    """Read the candidates' articles in rank order, a batch at a time, until TOP_N are really about the topic.
+    The last day's stories come first (by coverage), then older ones newest first."""
     kept = []
     with ThreadPoolExecutor(max_workers=6) as pool:
-        for i, page in zip(candidates, pool.map(lambda x: read_page(x["link"]), candidates)):
-            text = " ".join((i["title"], i["desc"], page.get("lead", ""), page.get("body", ""))).lower()
-            if not on_topic(text, cfg):
-                continue
-            i["points"] = summary_lines(page, i["desc"], cfg["must"], i["title"])
-            if not i.get("image") and page.get("image"):
-                i["image"] = page["image"]
-            kept.append(i)
-    return kept[:TOP_N]
+        for b in range(0, len(candidates), 12):
+            batch = candidates[b:b + 12]
+            for i, page in zip(batch, pool.map(lambda x: read_page(x["link"]), batch)):
+                text = " ".join((i["title"], i["desc"], page.get("lead", ""), page.get("body", ""))).lower()
+                if not on_topic(text, cfg):
+                    continue
+                i["points"] = summary_lines(page, i["desc"], cfg["must"], i["title"])
+                if not i.get("image") and page.get("image"):
+                    i["image"] = page["image"]
+                kept.append(i)
+            if len(kept) >= TOP_N:
+                break
+    fresh = time.time() - FRESH_HOURS * 3600
+    new = [i for i in kept if i["ts"] >= fresh]                       # already in coverage order
+    old = sorted((i for i in kept if i["ts"] < fresh), key=lambda i: i["ts"], reverse=True)
+    return (new + old)[:TOP_N]
 
 
 def run_update():
@@ -642,6 +663,69 @@ def kick_update():
     return False
 
 
+# Names spotted in a story's headline and summary, for the "Copy to share" text. Each entry: the name shown,
+# then the words that count as a mention. Short all-capital names (US, UK, RTX...) must match exactly in capitals.
+_COUNTRY_NAMES = [
+    ("United States", ["United States", "US", "U.S.", "USA", "American", "Pentagon"]), ("China", ["China", "Chinese", "PLA"]),
+    ("Russia", ["Russia", "Russian", "Kremlin"]), ("Ukraine", ["Ukraine", "Ukrainian", "Kyiv"]), ("Iran", ["Iran", "Iranian", "Tehran"]),
+    ("Israel", ["Israel", "Israeli", "IDF"]), ("North Korea", ["North Korea", "North Korean", "Pyongyang", "DPRK"]),
+    ("South Korea", ["South Korea", "South Korean", "Seoul"]), ("Japan", ["Japan", "Japanese"]), ("Taiwan", ["Taiwan", "Taiwanese"]),
+    ("India", ["India", "Indian Army", "Indian Navy", "Indian Air Force", "New Delhi"]), ("Pakistan", ["Pakistan", "Pakistani"]),
+    ("Turkey", ["Turkey", "Türkiye", "Turkish"]), ("Saudi Arabia", ["Saudi"]), ("UAE", ["UAE", "Emirati", "United Arab Emirates"]),
+    ("Qatar", ["Qatar"]), ("Yemen", ["Yemen", "Houthi", "Houthis"]), ("Syria", ["Syria", "Syrian"]), ("Iraq", ["Iraq", "Iraqi"]),
+    ("Lebanon", ["Lebanon", "Lebanese", "Hezbollah"]), ("Germany", ["Germany", "German", "Bundeswehr"]), ("France", ["France", "French"]),
+    ("United Kingdom", ["United Kingdom", "UK", "U.K.", "Britain", "British"]), ("Italy", ["Italy", "Italian"]),
+    ("Poland", ["Poland", "Polish"]), ("Norway", ["Norway", "Norwegian"]), ("Sweden", ["Sweden", "Swedish"]),
+    ("Finland", ["Finland", "Finnish"]), ("Netherlands", ["Netherlands", "Dutch"]), ("Spain", ["Spain", "Spanish"]),
+    ("Greece", ["Greece", "Greek"]), ("Romania", ["Romania", "Romanian"]), ("Belarus", ["Belarus"]), ("Canada", ["Canada", "Canadian"]),
+    ("Australia", ["Australia", "Australian"]), ("Singapore", ["Singapore"]), ("Malaysia", ["Malaysia", "Malaysian"]),
+    ("Indonesia", ["Indonesia", "Indonesian"]), ("Philippines", ["Philippines", "Philippine", "Filipino"]),
+    ("Vietnam", ["Vietnam", "Vietnamese"]), ("Thailand", ["Thailand"]), ("Brazil", ["Brazil", "Brazilian"]),
+    ("Egypt", ["Egypt", "Egyptian"]), ("NATO", ["NATO"]),
+]
+_COMPANY_NAMES = [
+    ("Lockheed Martin", ["Lockheed"]), ("RTX (Raytheon)", ["Raytheon", "RTX"]), ("Boeing", ["Boeing"]),
+    ("Northrop Grumman", ["Northrop"]), ("General Dynamics", ["General Dynamics"]), ("L3Harris", ["L3Harris"]),
+    ("BAE Systems", ["BAE"]), ("Anduril", ["Anduril"]), ("General Atomics", ["General Atomics"]), ("Kratos", ["Kratos"]),
+    ("AeroVironment", ["AeroVironment"]), ("Textron", ["Textron"]), ("Leidos", ["Leidos"]), ("Palantir", ["Palantir"]),
+    ("Shield AI", ["Shield AI"]), ("Epirus", ["Epirus"]), ("MBDA", ["MBDA"]), ("Thales", ["Thales"]), ("Airbus", ["Airbus"]),
+    ("Safran", ["Safran"]), ("Dassault", ["Dassault"]), ("Naval Group", ["Naval Group"]), ("KNDS", ["KNDS", "Nexter", "Krauss-Maffei"]),
+    ("Rheinmetall", ["Rheinmetall"]), ("Diehl Defence", ["Diehl"]), ("Hensoldt", ["Hensoldt"]), ("Helsing", ["Helsing"]),
+    ("Leonardo", ["Leonardo"]), ("Saab", ["Saab"]), ("Kongsberg", ["Kongsberg"]), ("Nammo", ["Nammo"]), ("Patria", ["Patria"]),
+    ("Rafael", ["Rafael Advanced", "Israel's Rafael"]),   # not plain "Rafael": IAEA chief Rafael Grossi is often in the news ("Israel Aerospace Industries", ["Israel Aerospace", "IAI"]), ("Elbit Systems", ["Elbit"]),
+    ("Hanwha", ["Hanwha"]), ("LIG Nex1", ["LIG Nex1", "LIG Nex"]), ("Korea Aerospace Industries", ["Korea Aerospace", "KAI"]),
+    ("Hyundai Rotem", ["Hyundai Rotem"]), ("Mitsubishi Heavy Industries", ["Mitsubishi Heavy"]), ("Kawasaki Heavy Industries", ["Kawasaki Heavy"]),
+    ("ST Engineering", ["ST Engineering"]), ("Baykar", ["Baykar"]), ("Roketsan", ["Roketsan"]), ("Aselsan", ["Aselsan"]),
+    ("Turkish Aerospace", ["Turkish Aerospace", "TUSAŞ"]), ("Norinco", ["Norinco"]), ("CASC", ["CASC"]), ("CASIC", ["CASIC"]),
+    ("AVIC", ["AVIC"]), ("Almaz-Antey", ["Almaz-Antey"]), ("Rostec", ["Rostec"]), ("Kalashnikov", ["Kalashnikov"]),
+    ("Tactical Missiles Corporation", ["Tactical Missiles Corporation"]), ("BrahMos Aerospace", ["BrahMos Aerospace"]),
+    ("Bharat Dynamics", ["Bharat Dynamics", "BDL"]), ("Bharat Electronics", ["Bharat Electronics", "BEL"]),
+    ("Hindustan Aeronautics", ["Hindustan Aeronautics", "HAL"]), ("Tata Advanced Systems", ["Tata Advanced"]),
+    ("Larsen & Toubro", ["Larsen & Toubro", "L&T"]), ("Solar Industries", ["Solar Industries"]), ("Embraer", ["Embraer"]),
+    ("Avibras", ["Avibras"]), ("Denel", ["Denel"]), ("EDGE Group", ["EDGE Group"]), ("Fire Point", ["Fire Point"]),
+]
+
+
+def _name_rx(words):
+    exact = [w for w in words if w.isupper() or "." in w or "&" in w]
+    loose = [w for w in words if w not in exact]
+    parts = []
+    if exact:
+        parts.append(re.compile(r"(?<![\w.])(?:%s)(?![\w])" % "|".join(map(re.escape, exact))))
+    if loose:
+        parts.append(re.compile(r"\b(?:%s)\b" % "|".join(map(re.escape, loose)), re.I))
+    return parts
+
+
+_COUNTRY_RX = [(name, _name_rx(w)) for name, w in _COUNTRY_NAMES]
+_COMPANY_RX = [(name, _name_rx(w)) for name, w in _COMPANY_NAMES]
+
+
+def mentions(text, table, limit=4):
+    """Names from the table that appear in the text, in table order (most relevant first), at most `limit`."""
+    return [name for name, rxs in table if any(rx.search(text) for rx in rxs)][:limit]
+
+
 def topic_items(topic):
     """The latest snapshot's stories for a topic, topped up to TOP_N with the newest stories from earlier
     snapshots (no repeats, nothing older than NEWS_MAX_AGE_DAYS)."""
@@ -656,7 +740,9 @@ def topic_items(topic):
             if key in seen or i.get("link") in seen or (n and i.get("ts", 0) < cutoff):
                 continue
             seen.update((key, i.get("link")))
-            out.append(dict(i, rank=len(out) + 1, earlier=bool(n)))
+            text = " ".join([i.get("title") or ""] + list(i.get("points") or []))
+            out.append(dict(i, rank=len(out) + 1, earlier=bool(n),
+                            countries=mentions(text, _COUNTRY_RX), companies=mentions(text, _COMPANY_RX)))
             if len(out) >= TOP_N:
                 return out
     return out
@@ -1818,6 +1904,9 @@ STD_KINDS = ["Standard", "Handbook", "Test method", "Specification", "Guide"]
 # Listed with their official source only: no overview and no "Ask this standard" (public-information rule:
 # no design, test or qualification guides for weapon subsystems).
 STD_REFERENCE_ONLY = {"Munition & fuze safety"}
+# First cut: "Ask this standard" only for EMI/EMC and HERO. A standard needs both a place here and its
+# search file in standards_index/ (built on a PC from the official PDF).
+STD_ASK = {"MIL-STD-461", "MIL-STD-464"}   # EMI/EMC, and E3 including HERO
 # Direct links to the free official PDF, where one is stable (otherwise the card links to the source's search).
 STD_LINKS = {
     "NASA-STD-5001": "https://standards.nasa.gov/sites/default/files/standards/NASA/B-w/CHANGE-3/3/2022-10-24-NASA-STD-5001B-w-Change-3-Approved.pdf",
@@ -2375,7 +2464,7 @@ def std_all():
         s["note"] = store["std_notes"].get(k, "")
         s["reference_only"] = s["area"] in STD_REFERENCE_ONLY
         s["has_overview"] = s["num"] in STD_DETAIL and not s["reference_only"]
-        s["has_search"] = not s["reference_only"] and std_has_search(s["num"])
+        s["has_search"] = s["num"] in STD_ASK and not s["reference_only"] and std_has_search(s["num"])
         if not s["custom"] and s["num"] in STD_LINKS:
             s["link"] = STD_LINKS[s["num"]]
     return rows
@@ -2468,7 +2557,7 @@ STD_INDEX_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "standa
 _STOP = set("""a an and are as at be been but by can could do does for from had has have how i if in into is it its
 me my no not of on or our should so than that the their them then there these they this to us was we were what when
 where which who why will with would you your about any all also more most must need needs shall such tell
-standard document please give show explain say says find""".split())
+standard document please give show explain say says find requirement requirements required comply purpose""".split())
 _TOKEN = re.compile(r"[a-z0-9]+(?:[.\-][a-z0-9]+)*")
 _idx_cache = OrderedDict()
 _idx_lock = threading.Lock()
@@ -2536,7 +2625,7 @@ def std_search(num, question, top=5):
     idx = std_index(num)
     q = list(dict.fromkeys(_terms(question)))
     if not q:
-        return idx, [], []
+        return idx, [], [], []
     n, k1, b = len(idx["docs"]), 1.2, 0.75
     qlow = question.lower()
     words = [w for w in dict.fromkeys(_TOKEN.findall(qlow)) if w not in _STOP and len(w) > 2]   # for highlighting
@@ -2554,21 +2643,103 @@ def std_search(num, question, top=5):
             continue
         low = text.lower()
         s *= 1 + 0.25 * sum(1 for bg in bigrams if bg in low)        # the words appear together
-        s *= 1.15 if re.search(r"\bshall\b", low) else 1.0            # states a requirement
+        s *= 1.3 if re.search(r"\bshall\b", low) else 1.0             # states a requirement
+        if re.match(r"3(\.|$)", sec or "") and "defin" not in question.lower():
+            s *= 0.6   # section 3 of a MIL-STD is its definitions: short, word-dense, rarely the answer
         if re.search(r"\.{6,}|(?:\s\d+\s*){12,}", text):              # contents pages and number tables
             s *= 0.35
         scored.append((s, i))
     scored.sort(reverse=True)
-    out, used = [], set()
+    out, used, ids = [], set(), []
     for s, i in scored:
         page, sec, text, tf, dl, ctx = idx["docs"][i]
         if (page, sec) in used:
             continue
         used.add((page, sec))
+        ids.append(i)
         out.append({"page": page, "section": sec, "context": ctx, "text": _snippet(text, words), "score": round(s, 2)})
         if len(out) >= top:
             break
-    return idx, out, words
+    return idx, out, words, direct_answer(idx, [i for _, i in scored[:12]], q, question)
+
+
+# ---- a direct answer: the 1-3 sentences of the top passages that best answer the question ----
+# Free and exact: every sentence is the standard's own wording, cited with its section and page.
+_SENT_SPLIT = re.compile(r"(?<=[.;:])\s+(?=[A-Z(\"“]|(?:[A-Z]\.)?\d{1,3}(?:\.\d{1,3})+\.?\s+[A-Z])")
+_HEADING = re.compile(r"^(?:[A-Z]\.)?\d{1,3}(?:\.\d{1,3}){0,5}\.?\s+[^.]{2,90}\.\s+(?=[A-Z])")
+_ANSWER_SYNONYMS = {
+    "apply": ("applicable", "applicability"), "frequency": ("hz", "khz", "mhz", "ghz"),
+    "far": ("distance", "cm", "meter", "metre"), "distance": ("cm", "meter", "metre"),
+    "long": ("duration", "minute", "hour", "second"), "limit": ("exceed", "maximum"),
+}
+_QUANT = re.compile(r"\b(how (long|many|much|far|often|high|low)|limit|level|minimum|maximum|frequency|duration|value|range|"
+                    r"temperature|voltage|current|distance|time|rate)\b", re.I)
+
+
+def direct_answer(idx, ids, q, question):
+    """Score every sentence of the best passages against the question and keep the 1-3 that answer it.
+    A sentence counts for how many of the question's (rarer) words it contains, more if it states a
+    requirement ("shall"), holds a figure when the question asks for one, or is a definition when
+    the question asks what something is."""
+    n, df = len(idx["docs"]), idx["df"]
+    idf = {t: math.log(1 + (n - df[t] + 0.5) / (df[t] + 0.5)) for t in q}
+    total = sum(idf.values()) or 1
+    want_num = bool(_QUANT.search(question))
+    want_def = (bool(re.match(r"\s*(what\s+(is|are|does)|define|meaning\s+of)\b", question, re.I))
+                and not re.search(r"\b(requirements?|required|need|must|shall|how|limits?|test(ing)?)\b", question, re.I))
+    qwords = [w for w in _TOKEN.findall(question.lower()) if w not in _STOP]
+    phrases = [a + " " + b for a, b in zip(qwords, qwords[1:])]   # e.g. "hero safe": the heading should say exactly that
+    # words a standard uses for the same idea ("apply" / "applicable", a frequency written as kHz or MHz)
+    extra = {}
+    for t in q:
+        for alt in _ANSWER_SYNONYMS.get(t, ()):
+            extra[alt] = idf.get(t, 1.0) * 0.8
+    cands = []
+    for rank, i in enumerate(ids):
+        page, sec, text, tf, dl, ctx = idx["docs"][i]
+        heading, first = "", False   # the latest heading in this passage: its words count for the sentences under it
+        for sent in _SENT_SPLIT.split(text):
+            sent = sent.strip()
+            m = _HEADING.match(sent)
+            if m:                                            # "5.9.3 Title. First sentence..." -> keep the title as context
+                heading, sent, first = m.group(0), sent[m.end():], True
+            elif re.match(r"^(?:[A-Z]\.)?\d{1,3}(?:\.\d{1,3}){0,5}\.?\s", sent) and len(sent.split()) <= 12:
+                heading, first = sent, True                  # a heading on its own: context only, never an answer
+                continue
+            lead, first = first, False                       # the first sentence under a heading (a definition's body)
+            letters = sum(c.isalpha() for c in sent)
+            if not (40 <= len(sent) <= 480) or letters < 0.6 * len(sent) or re.match(r"(FIGURE|TABLE)\b", sent):
+                continue
+            terms = set(_terms(sent + " " + heading))
+            hit = sum(idf[t] for t in q if t in terms) + sum(w for t, w in extra.items() if t in terms and t not in q)
+            if not hit:
+                continue
+            s = min(1.0, hit / total)                        # share of the question it covers
+            hl = re.sub(r"\s+", " ", heading.lower())
+            if any(re.search(r"(?<![a-z])" + re.escape(ph) + r"(?![a-z])", hl) for ph in phrases):
+                s *= 1.3                                     # the heading names exactly what was asked
+            s *= 0.8 if ctx.lower().startswith("appendix") else 1.0   # appendices explain; the body states the requirement
+            s *= 1.35 if re.search(r"\b(shall|must)\b", sent, re.I) else 1.0
+            if want_num and re.search(r"\d", sent):
+                s *= 1.3
+            if want_def and re.match(r"3(\.|$)", sec or ""):
+                s *= 1.5 * (1.4 if lead else 1.0)
+            if not want_def and re.match(r"3(\.|$)", sec or ""):
+                s *= 0.7
+            s *= 1 / (1 + 0.08 * rank)                       # passages ranked higher count a little more
+            s *= 1 / (1 + max(0, len(sent) - 260) / 400)     # prefer sentences short enough to read at a glance
+            cands.append((s, sent, page, sec, ctx))
+    cands.sort(key=lambda c: -c[0])
+    out, seen = [], set()
+    for s, sent, page, sec, ctx in cands:
+        key = re.sub(r"[^a-z]", "", sent.lower())[:90]
+        if key in seen or (out and s < 0.6 * out[0]["score"]):
+            continue
+        seen.add(key)
+        out.append({"text": sent, "page": page, "section": sec, "context": ctx, "score": round(s, 3)})
+        if len(out) >= 3:
+            break
+    return out
 
 
 def std_find(num):
@@ -2607,10 +2778,10 @@ def standards_ask():
     if len(question) > 300:
         return jsonify({"error": "Keep the question under 300 characters."}), 400
     try:
-        idx, answers, words = std_search(s["num"], question)
+        idx, answers, words, answer = std_search(s["num"], question)
     except Exception:
         return jsonify({"error": "Could not read the search file for this standard."}), 500
-    return jsonify({"answers": answers, "words": words, "file": idx["meta"].get("file"),
+    return jsonify({"answers": answers, "answer": answer, "words": words, "file": idx["meta"].get("file"),
                     "revision": idx["meta"].get("revision"), "pages": idx["meta"].get("pages")})
 
 
@@ -2746,7 +2917,16 @@ dialog::backdrop{background:rgb(5 8 10 / .72)}
 .ans .where{display:flex;flex-wrap:wrap;gap:6px 10px;margin-bottom:5px;font-family:var(--display);font-weight:700;font-size:.7rem;letter-spacing:.12em;text-transform:uppercase;color:var(--accent)}
 .ans .where span:last-child{color:var(--muted);letter-spacing:.06em;text-transform:none;font-weight:500}
 .ans p{margin:0;font-size:.95rem;line-height:1.5;overflow-wrap:anywhere;white-space:pre-line}
-.ans mark{background:rgb(227 179 74 / .28);color:var(--ink);border-radius:3px;padding:0 1px}
+.ans mark,.direct mark{background:rgb(227 179 74 / .28);color:var(--ink);border-radius:3px;padding:0 1px}
+/* the direct answer card */
+.direct{margin-top:12px;padding:14px 16px;border:1px solid var(--accent);border-radius:12px;background:rgb(227 179 74 / .07);display:grid;gap:12px}
+.direct .dlab{margin:0;font-family:var(--display);font-weight:700;font-size:.74rem;letter-spacing:.18em;text-transform:uppercase;color:var(--accent)}
+.direct .ditem{display:grid;gap:4px;padding-left:12px;border-left:2px solid rgb(227 179 74 / .55)}
+.direct .ditem p{margin:0;font-size:1.02rem;line-height:1.5;color:var(--ink);overflow-wrap:anywhere}
+.direct .dcite{font-family:var(--display);font-weight:500;font-size:.78rem;letter-spacing:.06em;color:var(--muted)}
+.direct .dnote{margin:0;color:var(--muted);font-size:.82rem;font-style:italic}
+.moreans{margin-top:10px}
+.moreans summary{cursor:pointer;color:var(--accent);font-family:var(--display);font-weight:700;font-size:.72rem;letter-spacing:.14em;text-transform:uppercase}
 .nt textarea{width:100%;min-height:5.5rem;padding:9px 12px;border:1px solid var(--line);border-radius:10px;background:var(--field);font-size:.95rem;resize:vertical}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:8px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
@@ -2970,8 +3150,8 @@ function highlighted(text, words) {
 }
 function askBox(s, meta) {
   var box = section('Ask this standard', null, 'ask');
-  box.append(el('p', 'Ask in plain words, e.g. "what do I need to do for humidity testing". The answer is the passages of ' +
-    (meta.revision || 'the official document') + ' that best match your words, quoted as written with their page number. Searches one standard at a time.', 'how'));
+  box.append(el('p', 'Ask in plain words, e.g. "what are the HERO requirements for ordnance". The answer gives the sentences of ' +
+    (meta.revision || 'the official document') + ' that answer your question, quoted word for word with their section and page.', 'how'));
   var norm = function (v) { return (v || '').toLowerCase().replace(/\(.*?\)/g, '').replace(/[^a-z0-9]/g, ''); };
   if (meta.current && norm(meta.current) !== norm(meta.revision)) {
     box.append(el('p', 'Note: this search uses ' + meta.revision + '. The current version on ASSIST is ' + meta.current +
@@ -2982,7 +3162,7 @@ function askBox(s, meta) {
   b.type = 'submit';
   f.append(inp, b);
   var msg = el('p', '', 'how'); msg.setAttribute('aria-live', 'polite'); msg.style.marginTop = '10px';
-  var list = el('ol', null, 'ans');
+  var list = el('div', null, 'anslist');
   box.append(f);
   if (meta.examples && meta.examples.length) {
     var ex = el('div', null, 'ex');
@@ -3001,13 +3181,32 @@ function askBox(s, meta) {
         if (my !== askToken) return;
         b.disabled = false;
         if (!j.answers.length) { msg.textContent = 'Nothing in the document matches those words. Try other words, a method number or a shorter question.'; return; }
-        msg.textContent = 'Best ' + j.answers.length + ' passages from the document. Check the full text on the page shown before relying on it.';
+        var where = function (a) { return [a.context, a.section ? 'Section ' + a.section : '', 'PDF page ' + a.page].filter(Boolean).join(' · '); };
+        var passages = el('ol', null, 'ans');
         j.answers.forEach(function (a) {
           var li = el('li'), w = el('div', null, 'where');
           w.append(el('span', 'PDF page ' + a.page), el('span', [a.context, a.section ? 'Section ' + a.section : ''].filter(Boolean).join(' · ')));
           li.append(w, highlighted(a.text, j.words));
-          list.append(li);
+          passages.append(li);
         });
+        if (j.answer && j.answer.length) {
+          // the direct answer: the standard's own sentences that answer the question, each with where it is
+          msg.textContent = '';
+          var card = el('div', null, 'direct');
+          card.append(el('p', 'Answer', 'dlab'));
+          j.answer.forEach(function (a) {
+            var item = el('div', null, 'ditem');
+            item.append(highlighted(a.text, j.words), el('span', where(a), 'dcite'));
+            card.append(item);
+          });
+          card.append(el('p', 'Quoted word for word from ' + (s.num) + '. Check the full clause before relying on it.', 'dnote'));
+          var more = el('details', null, 'moreans');
+          more.append(el('summary', 'Show where this comes from (' + j.answers.length + ' passages)'), passages);
+          list.append(card, more);
+        } else {
+          msg.textContent = 'No single sentence answers that directly; these are the closest passages. Check the full text on the page shown.';
+          list.append(passages);
+        }
       }, function (e) { if (my !== askToken) return; b.disabled = false; msg.textContent = e.message; msg.className = 'how err'; });
   }
   f.addEventListener('submit', function (e) { e.preventDefault(); ask(); });
@@ -3029,9 +3228,15 @@ function notesBox(s) {
   };
   row.append(save, msg);
   if (s.custom) {
-    var del = el('button', 'Remove standard', 'btn alt sm'); del.type = 'button';
+    var del = el('button', 'Remove standard', 'btn alt sm'), armT = null; del.type = 'button';
     del.onclick = function () {
-      if (!confirm('Remove ' + s.num + ' from the library? Its notes are removed too.')) return;
+      // two taps instead of a pop-up confirm, which some browsers block (silently cancelling)
+      if (!armT) {
+        del.textContent = 'Tap again to remove (notes too)';
+        armT = setTimeout(function () { armT = null; del.textContent = 'Remove standard'; }, 3000);
+        return;
+      }
+      clearTimeout(armT); armT = null;
       del.disabled = true;
       post({ action: 'delete', num: s.num }).then(function (j) { D.standards = j.standards; closeDetail(); draw(); }, function (e) { del.disabled = false; msg.textContent = e.message; msg.className = 'how err'; });
     };
@@ -3137,11 +3342,20 @@ h1{margin:0;font-family:var(--display);font-weight:700;font-size:clamp(1.8rem,5v
 .rail{list-style:none;margin:0;padding:20px var(--gut) 30px;display:flex;gap:clamp(14px,2vw,22px);overflow-x:auto;scroll-snap-type:x proximity;
   scroll-padding-inline:var(--gut);scrollbar-width:none;-webkit-overflow-scrolling:touch}
 .rail::-webkit-scrollbar{display:none}
-.item{flex:none;display:flex;scroll-snap-align:start}
+.item{flex:none;display:flex;scroll-snap-align:start;position:relative}
+/* "Copy to share" sits at the foot of the card, below the summary. It is outside the card link (so tapping it
+   never opens the article) and placed over the space .txt keeps free at the bottom. */
+.copy{position:absolute;left:15px;bottom:14px;z-index:3;display:inline-flex;align-items:center;gap:6px;cursor:pointer;padding:5px 11px 5px 9px;border-radius:999px;
+  border:1px solid rgb(227 179 74 / .7);background:rgb(13 18 22 / .82);color:var(--accent);font-family:var(--display);font-weight:700;font-size:.66rem;
+  letter-spacing:.12em;text-transform:uppercase;transition:transform .18s ease-out,background .15s}
+.copy svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.copy:hover{background:var(--accent);color:var(--accent-ink)}
+.copy.done{background:#2f7d4f;border-color:#6fd39b;color:#fff}
+@media (hover:hover){.item:hover .copy{transform:translateY(-4px)}}
 .bubble{flex:1;position:relative;width:var(--cw);display:flex;flex-direction:column;box-sizing:border-box;overflow:hidden;
   border:1px solid var(--line);border-radius:16px;background:linear-gradient(160deg,#1b2630,#11181e);
   color:var(--ink);text-decoration:none;box-shadow:0 14px 30px rgb(0 0 0 / .45);transition:transform .18s ease-out,border-color .18s,box-shadow .18s;-webkit-tap-highlight-color:transparent}
-@media (hover:hover){.bubble:hover{transform:translateY(-4px);border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),0 22px 40px rgb(0 0 0 / .55),0 0 30px rgb(227 179 74 / .14)}}
+@media (hover:hover){.item:hover .bubble{transform:translateY(-4px);border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),0 22px 40px rgb(0 0 0 / .55),0 0 30px rgb(227 179 74 / .14)}}
 .bubble:active{transform:translateY(-1px)}
 .pic{position:relative;flex:none;aspect-ratio:16 / 10;background:linear-gradient(160deg,#1f2a32,#0f161b)}
 .pic img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
@@ -3153,7 +3367,7 @@ h1{margin:0;font-family:var(--display);font-weight:700;font-size:clamp(1.8rem,5v
   color:var(--accent);-webkit-text-stroke:2px #0d1216;paint-order:stroke fill;text-shadow:0 3px 0 rgb(0 0 0 / .7)}
 .src{position:absolute;right:10px;top:10px;z-index:2;max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:3px 9px;border-radius:999px;
   border:1px solid var(--accent);background:rgb(13 18 22 / .8);color:var(--accent);font-family:var(--display);font-weight:700;font-size:.62rem;letter-spacing:.1em}
-.txt{display:grid;align-content:start;gap:8px;padding:12px 15px 16px;flex:1}
+.txt{display:grid;align-content:start;gap:8px;padding:12px 15px 58px;flex:1}
 .ttl{margin:0;font-weight:600;font-size:1.04rem;line-height:1.28;color:var(--ink);display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 .meta{margin:0;color:var(--muted);font-size:.84rem}
 .sumh{margin:4px 0 0;display:flex;align-items:center;gap:8px;font-family:var(--display);font-weight:700;font-size:.62rem;letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}
@@ -3192,7 +3406,7 @@ h1{margin:0;font-family:var(--display);font-weight:700;font-size:clamp(1.8rem,5v
         <button class="arrow next" id="next" type="button" aria-label="Scroll right"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 2.5 11 8l-5.5 5.5"/></svg></button>
       </div>
       <p class="empty" id="empty" hidden></p>
-      <p class="foot">Updated once a day at 6am. Summaries are the article's own key sentences; tap a card to read the full story.</p>
+      <p class="foot">Updated once a day at 6am. Summaries are the article's own key sentences; tap a card to read the full story, or Copy to share a short summary in WhatsApp, Telegram or email.</p>
     </section>
   </main>
 </div>
@@ -3243,8 +3457,49 @@ function card(d, rank) {
   } else {
     txt.append(el('p', 'Open the article for the full story.', 'sum none'));
   }
-  a.append(pic, txt); li.append(a);
+  a.append(pic, txt); li.append(a, copyButton(d));
   return li;
+}
+
+/* ---- copy a short, plain-text summary to share in WhatsApp, Telegram, Teams or email ---- */
+function shareText(d) {
+  var date = new Date(d.ts * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+  // keep it a quick read: the first summary sentence, plus the second only if both stay short
+  var pts = d.points || [], ctx = pts[0] || '';
+  if (pts[1] && (ctx + ' ' + pts[1]).length <= 300) ctx += ' ' + pts[1];
+  var lines = ['Top 10 News · ' + topic, 'Headline: ' + d.title, 'Date of article: ' + date];
+  if (d.source) lines.push('Source: ' + d.source);
+  if (d.countries && d.countries.length) lines.push('Countries: ' + d.countries.join(', '));
+  if (d.companies && d.companies.length) lines.push('Companies: ' + d.companies.join(', '));
+  if (ctx) lines.push('Context: ' + ctx);
+  if (safeUrl(d.link)) lines.push('Link: ' + d.link);
+  lines.push('Shared from GW University');
+  return lines.join('\n');
+}
+function copyOld(text) {   // older browsers, or when the clipboard API says no: copy through a hidden text box
+  return new Promise(function (ok, fail) {
+    var t = el('textarea'); t.value = text; t.setAttribute('readonly', ''); t.style.position = 'fixed'; t.style.opacity = '0';
+    document.body.append(t); t.select();
+    try { document.execCommand('copy') ? ok() : fail(); } catch (e) { fail(); } finally { t.remove(); }
+  });
+}
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text).catch(function () { return copyOld(text); });
+  return copyOld(text);
+}
+var COPY_ICON = '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5"/></svg>';
+function copyButton(d) {
+  var b = el('button', null, 'copy'); b.type = 'button';
+  b.setAttribute('aria-label', 'Copy a short summary of this story to share');
+  function label(text) { b.innerHTML = COPY_ICON; b.append(document.createTextNode(text)); }   // icon is static markup
+  label('Copy');
+  b.onclick = function (e) {
+    e.preventDefault(); e.stopPropagation();
+    copyText(shareText(d)).then(function () { b.classList.add('done'); label('Copied ✓'); },
+                                function () { label('Copy failed'); })
+      .then(function () { setTimeout(function () { b.classList.remove('done'); label('Copy'); }, 2000); });
+  };
+  return b;
 }
 
 function renderTopics(list) {
@@ -4527,6 +4782,71 @@ BATTLE_LAB.update({
         ]},
 })
 
+# Categories are by type of weapon. Anti-ship missiles are cruise missiles, so they are listed there
+# (merged by country; a system already listed for that country is not repeated).
+_antiship = BATTLE_LAB.pop("Anti-ship missiles")
+_cruise = BATTLE_LAB["Cruise missiles"]
+_cruise["blurb"] = "Missiles that fly low and level like a small aircraft, against targets on land or at sea; most fly below the speed of sound."
+for _c in _antiship["countries"]:
+    _home = next((x for x in _cruise["countries"] if x["code"] == _c["code"]), None)
+    if _home is None:
+        _cruise["countries"].append(_c)
+    else:
+        _have = {s["name"] for s in _home["systems"]}
+        _home["systems"] += [s for s in _c["systems"] if s["name"] not in _have]
+
+# ---- launch platforms: how each country launches each weapon (L land, S ship, U submarine, A aircraft) ----
+# From public sources (Wikipedia infoboxes and operator pages; defence news for the country-specific cases noted).
+# Only what is in service or delivered for that country; a platform that has only been tested or is planned is left out.
+# Land = placed inside the operating country; Ship and Submarine = placed anywhere at sea; Air = no placement yet.
+_LAUNCH = {
+    # Hypersonic
+    ("RUS", "Avangard"): "L", ("RUS", "Kinzhal"): "A", ("RUS", "Oreshnik"): "L",
+    ("RUS", "Zircon"): "SUL",            # also fired from Bastion coastal launchers (Defence Blog, 2025-26)
+    ("CHN", "DF-17"): "L", ("CHN", "DF-27"): "L", ("CHN", "YJ-21"): "SA",
+    ("USA", "Dark Eagle"): "L", ("USA", "Conventional Prompt Strike"): "SU", ("USA", "ARRW"): "A", ("USA", "HACM"): "A",
+    ("PRK", "Hwasong-8"): "L", ("PRK", "Hwasong-16B"): "L", ("KOR", "Hycore"): "",
+    ("IND", "LRAShM"): "L", ("IND", "HSTDV"): "L", ("IND", "BrahMos-II"): "",
+    ("IRN", "Fattah-1"): "L", ("IRN", "Fattah-2"): "L", ("FRA", "V-MaX"): "L",
+    ("JPN", "HVGP"): "L", ("JPN", "Hypersonic cruise missile"): "",
+    # Cruise (including anti-ship)
+    ("USA", "Tomahawk"): "SUL", ("USA", "JASSM-ER"): "A", ("USA", "Harpoon"): "SA", ("USA", "LRASM"): "A", ("USA", "NSM"): "SL",
+    ("RUS", "Kalibr"): "SU", ("RUS", "Kh-101"): "A", ("RUS", "Iskander-K"): "L",
+    ("RUS", "Bastion (P-800 Oniks)"): "L", ("RUS", "Bal (Kh-35)"): "L",
+    ("CHN", "CJ-10"): "L", ("CHN", "CJ-100"): "L", ("CHN", "YJ-12"): "ASL", ("CHN", "YJ-18"): "SU",
+    ("GBR", "Storm Shadow"): "A", ("GBR", "Tomahawk"): "U",
+    ("FRA", "SCALP"): "A", ("FRA", "MdCN"): "SU", ("FRA", "Exocet"): "SUA",
+    ("DEU", "Taurus"): "A", ("UKR", "Storm Shadow"): "A", ("UKR", "Neptune"): "L",
+    ("IND", "LRLACM"): "L", ("IND", "SCALP"): "A", ("IND", "BrahMos"): "SLA",
+    ("PAK", "Babur"): "LU",              # Babur-3 submarine version deployed 2018 (Wikipedia)
+    ("KOR", "Hyunmoo-3"): "L", ("KOR", "Haeseong"): "S", ("JPN", "Tomahawk"): "S", ("JPN", "Type 12 (improved)"): "L",
+    ("TWN", "Hsiung Feng IIE"): "L", ("TWN", "Hsiung Feng III"): "SL", ("TUR", "SOM"): "A", ("TUR", "Atmaca"): "SL",
+    ("IRN", "Hoveyzeh"): "L", ("IRN", "Paveh"): "L", ("IRN", "Noor"): "SL", ("IRN", "Qader"): "SL",
+    ("AUS", "Tomahawk"): "S", ("AUS", "JASSM-ER"): "A", ("AUS", "NSM"): "S",    # fired from Hobart-class destroyers
+    ("ARE", "Black Shaheen"): "A", ("BRA", "MTC-300"): "L", ("NOR", "NSM"): "SL",
+    ("ITA", "Teseo / Otomat"): "S", ("SWE", "RBS-15"): "SLA", ("ISR", "Gabriel V"): "S",
+    ("SGP", "Blue Spear"): "S", ("SGP", "Harpoon"): "S",           # Formidable-class frigates (Janes)
+    ("MYS", "Exocet"): "SU",                                        # MM40 frigates, SM39 Scorpène submarines
+    ("IDN", "Exocet"): "S", ("IDN", "C-705"): "S", ("IDN", "BrahMos"): "L", ("IDN", "Atmaca"): "S",   # BrahMos: coastal battery
+    ("PHL", "BrahMos"): "L", ("VNM", "Bastion (P-800 Oniks)"): "L", ("VNM", "BrahMos"): "L",          # shore-based batteries
+    # Air and missile defence with naval versions in service
+    ("USA", "SM-6"): "SL", ("USA", "SM-3"): "SL", ("JPN", "SM-3 Block IIA"): "S",
+    ("CHN", "HQ-9"): "LS", ("CHN", "HQ-16"): "LS", ("RUS", "Pantsir"): "LS", ("ISR", "Barak MX"): "LS",
+    ("FRA", "VL MICA"): "LS", ("FRA", "Mistral"): "LS",
+    ("SGP", "Aster 15 (naval)"): "S", ("SGP", "VL MICA (naval)"): "S", ("SGP", "Barak"): "S",
+    ("MYS", "Sea Wolf"): "S", ("MYS", "VL MICA (naval)"): "S", ("IDN", "VL MICA (naval)"): "S",
+}
+_LAUNCH_DEFAULT = {"Hypersonic": None, "Ballistic missiles": "L", "Cruise missiles": None}   # None: must be listed above
+for _name, _cat in BATTLE_LAB.items():
+    for _c in _cat["countries"]:
+        _c["systems"] = [dict(s) for s in _c["systems"]]   # shared definitions become per-country copies
+        for _s in _c["systems"]:
+            _code = _LAUNCH.get((_c["code"], _s["name"]))
+            if _code is None:
+                _code = _LAUNCH_DEFAULT.get(_name, "L")
+                assert _code is not None, "no launch platform listed for %s %s" % (_c["code"], _s["name"])
+            _s["launch"] = [{"L": "Land", "S": "Ship", "U": "Submarine", "A": "Air"}[ch] for ch in "LSUA" if ch in _code]
+
 for _cat in BATTLE_LAB.values():
     for _c in _cat["countries"]:
         for _s in _c["systems"]:
@@ -4635,8 +4955,21 @@ h1{margin:0;justify-self:end;font-family:var(--display);font-weight:700;font-siz
 .chip.cur{box-shadow:0 0 0 2px rgb(255 255 255 / .25),0 2px 0 #000}
 .chip button{border:0;background:none;color:inherit;cursor:pointer;font-family:var(--display);font-weight:700;font-size:.72rem;letter-spacing:.06em}
 .chip .cs{display:inline-flex;align-items:center;gap:6px;padding:4px 4px 4px 10px}
-.chip .cx{padding:4px 9px 4px 6px;font-size:.78rem;opacity:.8}
-.chip .cx:hover{opacity:1}
+.chip .cs{padding:4px 11px 4px 10px}
+.chips .clr{flex:none;cursor:pointer;padding:4px 11px;border-radius:999px;border:1.5px dashed var(--muted);background:var(--panel);color:var(--muted);
+  font-family:var(--display);font-weight:700;font-size:.72rem;letter-spacing:.06em}
+.chips .clr:hover{color:var(--ink);border-color:var(--ink)}
+.chips .clr.armed{border-style:solid;border-color:#f0a08a;background:#c8553d;color:#fff}
+.chip{flex:none}
+/* in the details: move, remove, place another */
+.dacts{display:grid;gap:8px}
+.dacts .rmv,.dacts .addl{cursor:pointer;width:100%;box-sizing:border-box;padding:9px 14px;border-radius:999px;font-family:var(--display);font-weight:700;
+  font-size:.74rem;letter-spacing:.1em;text-transform:uppercase;white-space:normal;text-align:center}
+.dacts .rmv{border:1.5px solid #f0a08a;background:transparent;color:#f6a493}
+.dacts .rmv:hover{background:rgb(224 72 60 / .15)}
+.dacts .addl{border:1.5px dashed var(--accent);background:transparent;color:var(--accent)}
+.dacts .addl:hover{background:rgb(227 179 74 / .1)}
+@media (max-width:720px){.chips{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;padding-bottom:2px}.chips::-webkit-scrollbar{display:none}}
 .cdot{width:8px;height:8px;border-radius:50%;background:currentColor}
 .land.held-off{stroke:#f06050;stroke-width:1.2}
 .land.held-def{stroke:#78aaff;stroke-width:1.2}
@@ -4647,7 +4980,20 @@ h1{margin:0;justify-self:end;font-family:var(--display);font-weight:700;font-siz
 .lname{font-family:var(--display);font-weight:700;font-size:10px;letter-spacing:.08em;text-anchor:middle;paint-order:stroke;stroke:#0d1216;stroke-width:3px}
 .lnch.off .lname{fill:#f6a493}
 .lnch.def .lname{fill:#a9c8ff}
-.lnch{pointer-events:none}
+.lnch{cursor:pointer}
+.lnch .hitr{fill:transparent}
+.lnch .shp,.lnch .sub{display:none}
+.lnch.at-ship .veh,.lnch.at-sub .veh{display:none}
+.lnch.at-ship .shp,.lnch.at-sub .sub{display:inline}
+.lnch .mast{fill:none;stroke:#000;stroke-width:1.6;stroke-linecap:round}
+/* platform tags in the weapon list */
+.wp{display:flex;flex-wrap:wrap;gap:4px;margin-top:2px}
+.ptag{padding:1px 7px;border-radius:999px;border:1px solid rgb(203 189 146 / .5);color:#cbbd92;font-family:var(--display);font-weight:700;font-size:.62rem;letter-spacing:.08em;text-transform:uppercase}
+.lnch .lname{pointer-events:none}
+.lnch.cur .ring{stroke-width:3;stroke-dasharray:none}
+.lnch:focus-visible{outline:none}
+.lnch:focus-visible .ring{stroke:#fff;stroke-width:3}
+body.placing .lnch{cursor:crosshair}
 .lnch .ring{fill:none;stroke:var(--accent);stroke-width:1.5;stroke-dasharray:3 3}
 .lnch .pt{fill:var(--accent);stroke:#000;stroke-width:1}
 .lnch .body{fill:var(--token);stroke:#000;stroke-width:1.2;stroke-linejoin:round}
@@ -4840,7 +5186,7 @@ dialog::backdrop{background:rgb(0 0 0 / .55)}
   <p class="dh" id="dh">Choose your Strike</p>
   <p class="ds" id="ds">Pick a weapon type to see who has it.</p>
   <div class="opts" id="opts"></div>
-  <p class="soon">Each country lists the systems it has, made locally or bought. Launchers are placed on land inside that country.</p>
+  <p class="soon">Each country lists the systems it has, made locally or bought, and how each is launched. Land launchers go inside that country; ships and submarines anywhere at sea.</p>
 </dialog>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
@@ -4866,13 +5212,20 @@ function barH() { return $('#bar').offsetHeight; }
 
 var mode = null, selIso = null, selSys = null;   // the category, country and system being looked at
 var placing = false;
-// What is on the map: one strike and one defence system, each { cat, c: country, s: system, at: [lon, lat] or null }.
-// Picking another system of the same group replaces it; the chip's ✕ removes it.
-var slots = { Strike: null, Defence: null };
+// What is on the map: any number of launchers, strike and defence, each { id, cat, c: country, s: system, at: [lon, lat] }.
+// Placing never replaces an earlier one; tap a launcher (on the map or its chip) to move or remove it.
+var onmap = [], nextId = 1;
+var curId = null;      // the launcher being looked at, when the system shown is one on the map
+var moveId = null;     // while placing: the launcher being moved (null = placing a new one)
 function grpOf(cat) { return DATA[cat].group; }
-function selSlot() { var g = mode && grpOf(mode); return selSys && slots[g] && slots[g].s === selSys ? slots[g] : null; }
+function entry(id) { return onmap.filter(function (e) { return e.id === id; })[0] || null; }
+function selSlot() { var e = entry(curId); return e && selSys && e.s === selSys ? e : null; }
 function curLauncher() { var sl = selSlot(); return sl ? sl.at : null; }
-function placed() { return ['Strike', 'Defence'].map(function (g) { return slots[g]; }).filter(function (sl) { return sl && sl.at; }); }
+function placed() { return onmap; }
+function lastOf(s, iso) {   // the most recently placed launcher of this system in this country
+  var l = onmap.filter(function (e) { return e.s === s && (!iso || e.c.iso === iso); });
+  return l.length ? l[l.length - 1] : null;
+}
 var features = null, W = 0, H = 0, sy = 1, proj, path, svg, gWorld, gRing, gTicks, gCtr, gLaunch, zoom, box, T = d3.zoomIdentity, hexPat, lands;
 var KM_PER_DEG = 111.195;   // great-circle km per degree on a 6,371 km Earth
 
@@ -4981,13 +5334,13 @@ function paint() {
   if (!lands) return;
   var list = shown(), has = {};
   list.forEach(function (c) { has[c.iso] = true; });
-  var held = {};   // countries of the systems on the map, outlined in their ring colour
-  ['Strike', 'Defence'].forEach(function (g) { if (slots[g]) held[slots[g].c.iso] = cls(slots[g]); });
+  var held = {};   // countries with launchers on the map, outlined in their ring colour
+  onmap.forEach(function (e) { held[e.c.iso] = cls(e); });
   lands.classed('has', function (d) { return !!has[d.id]; }).classed('sel', function (d) { return d.id === selIso; })
     .classed('held-off', function (d) { return held[d.id] === 'off' && d.id !== selIso; })
     .classed('held-def', function (d) { return held[d.id] === 'def' && d.id !== selIso; });
   // once the chosen system's launcher is placed it replaces that country's counter, so the two never overlap
-  var hide = curLauncher() ? selIso : null;
+  var hide = curLauncher() && selSlot().on !== 'sea' ? selIso : null;
   var ctr = gCtr.selectAll('.ctr').data(list.filter(function (c) { return c.iso !== hide; }), function (d) { return d.iso; }).join(function (enter) {
     var g = enter.append('g').attr('class', 'ctr').attr('role', 'button').attr('tabindex', 0)
       .attr('aria-label', function (d) { return d.name + ', ' + d.systems.length + ' systems'; })
@@ -5005,20 +5358,35 @@ function paint() {
   var rings = ringData();
   gRing.selectAll('path').data(rings).join('path').attr('class', function (d) { return 'ring-' + d.cls; }).attr('d', function (d) { return path(d.geo); });
   // generic launcher vehicle: chassis, cab, raised container, wheels; the dot marks the exact spot
-  var ln = gLaunch.selectAll('.lnch').data(placed(), function (d) { return grpOf(d.cat); }).join(function (enter) {
-    var g = enter.append('g');
+  var ln = gLaunch.selectAll('.lnch').data(placed(), function (d) { return d.id; }).join(function (enter) {
+    var g = enter.append('g').attr('role', 'button').attr('tabindex', 0)
+      .on('click', function (ev, d) { if (placing) return; ev.stopPropagation(); showEntry(d.id); })   // while placing, a tap places
+      .on('keydown', function (ev, d) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); showEntry(d.id); } });
+    g.append('circle').attr('class', 'hitr').attr('r', 22);   // a generous tap target
     g.append('circle').attr('class', 'ring').attr('r', 16);
-    var v = g.append('g').attr('transform', 'translate(-17,-25)');
+    var v = g.append('g').attr('class', 'veh').attr('transform', 'translate(-17,-25)');   // land: launcher truck
     v.append('rect').attr('class', 'tube').attr('x', 4).attr('y', 3).attr('width', 22).attr('height', 8).attr('rx', 1.5).attr('transform', 'rotate(-14 4 11)');
     v.append('rect').attr('class', 'body').attr('x', 2).attr('y', 12).attr('width', 24).attr('height', 6).attr('rx', 1);
     v.append('path').attr('class', 'body').attr('d', 'M26 18V10h5l3 4v4z');
     [8, 16, 29].forEach(function (x) { v.append('circle').attr('class', 'wh').attr('cx', x).attr('cy', 20).attr('r', 3); });
+    var sh = g.append('g').attr('class', 'shp').attr('transform', 'translate(-17,-24)');   // sea: ship
+    sh.append('path').attr('class', 'body').attr('d', 'M1 13h32l-5 7H6z');
+    sh.append('rect').attr('class', 'body').attr('x', 11).attr('y', 6).attr('width', 11).attr('height', 7).attr('rx', 1);
+    sh.append('path').attr('class', 'mast').attr('d', 'M16.5 1v5M13 3h7');
+    var sb = g.append('g').attr('class', 'sub').attr('transform', 'translate(-17,-22)');    // sea: submarine
+    sb.append('path').attr('class', 'body').attr('d', 'M2 13c0-3 4-5 10-5h12c5 0 9 2 9 5s-4 5-9 5H12C6 18 2 16 2 13z');
+    sb.append('rect').attr('class', 'body').attr('x', 13).attr('y', 3).attr('width', 6).attr('height', 6).attr('rx', 1.5);
     g.append('circle').attr('class', 'pt').attr('r', 2.6);
     g.append('text').attr('class', 'lname').attr('y', 18);
     return g;
   });
-  ln.attr('class', function (d) { return 'lnch ' + cls(d); });
+  ln.attr('class', function (d) {
+    var kind = d.on === 'sea' ? (seaWord(d.s) === 'ship' ? ' at-ship' : ' at-sub') : ' at-land';
+    return 'lnch ' + cls(d) + kind + (d.id === curId && d.s === selSys ? ' cur' : '');
+  })
+    .attr('aria-label', function (d) { return lnLabel(d) + ' in ' + d.c.name + '. Open to move or remove.'; });
   ln.select('.lname').text(lnLabel);
+  ln.filter(function (d) { return d.id === curId; }).raise();
   place();
 }
 
@@ -5057,6 +5425,19 @@ function viewFor(c) {
   return view;
 }
 
+// A ship or submarine at sea: centre on it, zoomed so its range ring fills most of the visible area
+// (no ring: a 150 km circle around it, so the vessel and its surroundings show).
+function flyToSea(e) {
+  if (!svg) return;
+  var bar = barH(), sh = phone() ? sheetH() : 0;
+  var x0 = phone() ? 0 : PANEL, aw = W - x0, ah = H - bar - sh;
+  var circle = d3.geoCircle().center(e.at).radius((e.s.ring_km || 150) / KM_PER_DEG)();
+  var b = path.bounds(circle), dx = b[1][0] - b[0][0], dy = b[1][1] - b[0][1], p = P(e.at);
+  var k = dx > 0 && dy > 0 && dx < W * 0.9 ? Math.max(kFloor, Math.min(aw * 0.8 / dx, ah * 0.8 / dy, MAXK)) : Math.max(kFloor, 3);
+  var t = clamp(d3.zoomIdentity.translate(x0 + aw / 2, bar + ah / 2).scale(k).translate(-p[0], -p[1]));
+  (slow() ? svg : svg.transition().duration(750)).call(zoom.transform, t);
+}
+
 function flyTo(c, onlyIfSmall) {
   if (!svg) return;
   var v = viewFor(c);
@@ -5076,18 +5457,43 @@ function detail(c, s) {
   var st = el('span', null, 'pill');
   st.append(el('span', null, 'dot ' + statusClass(s.status)), document.createTextNode(s.status));
   var dl = el('dl', null, 'stats');
-  var rows = [['Origin', origin(s)], ['Made by', s.maker || 'Not publicly confirmed'], ['Range', s.range], ['Speed', s.speed]], launcher = curLauncher();
+  var rows = [['Origin', origin(s)], ['Made by', s.maker || 'Not publicly confirmed'],
+              ['Launched from', s.launch.length ? s.launch.map(function (x) { return x + ' launch'; }).join(' · ') : 'Not published'],
+              ['Range', s.range], ['Speed', s.speed]], launcher = curLauncher(), sl = selSlot();
   if (launcher) {
-    rows.push(['Launcher', fmtLL(launcher)]);
+    rows.push(['Launcher', fmtLL(launcher) + (sl.on === 'sea' ? ' (at sea, ' + seaWord(s) + ')' : '')]);
     rows.push(['Ring', s.ring_km ? s.ring_km.toLocaleString('en-US') + ' km radius. ' + s.ring_note + '.'
                                  : 'No published range, so no ring is drawn.']);
   }
   rows.forEach(function (r) {
     var row = el('div', null, 'stat'); row.append(el('dt', r[0]), el('dd', r[1])); dl.append(row);
   });
-  var cta = $('#launch').cloneNode(true);   // same icon and label as the top-bar button
-  cta.removeAttribute('id'); cta.hidden = false;
-  cta.onclick = function () { setPlacing(!placing); };
+  var opts = placeOpts(s), acts = el('div', null, 'dacts');
+  function placeBtn(where, label) {   // same look as the top-bar button
+    var b = $('#launch').cloneNode(true);
+    b.removeAttribute('id'); b.hidden = false;
+    if (label) b.dataset.label = label;
+    b.onclick = function () { setPlacing(!placing, launcher ? undefined : null, where); };
+    return b;
+  }
+  if (!opts.length) {
+    acts.append(el('p', s.launch.indexOf('Air') >= 0 ? 'Air-launched: placing aircraft on the map is not available yet.'
+                                                       : 'Launch platform not published, so it cannot be placed yet.', 'dnote'));
+  } else if (launcher) {
+    acts.append(placeBtn(sl.on));   // moves this launcher, on land or at sea as placed
+    var rm = el('button', 'Remove from map', 'rmv'); rm.type = 'button';
+    rm.onclick = function () { removeEntry(curId); };
+    acts.append(rm);
+    opts.forEach(function (w) {
+      var add = el('button', '+ Place another ' + (opts.length > 1 ? (w === 'land' ? 'on land' : 'at sea') : s.name), 'addl'); add.type = 'button';
+      add.onclick = function () { setPlacing(true, null, w); };
+      acts.append(add);
+    });
+  } else if (opts.length > 1) {
+    acts.append(placeBtn('land', 'Place on land'), placeBtn('sea', 'Place at sea (' + seaWord(s) + ')'));
+  } else {
+    acts.append(placeBtn(opts[0], opts[0] === 'sea' ? 'Place at sea (' + seaWord(s) + ')' : null));
+  }
   var key = null;
   if (launcher && s.ring_km) {
     key = el('p', null, 'dnote');
@@ -5098,7 +5504,7 @@ function detail(c, s) {
   var a = el('a', 'Read on Wikipedia ↗', 'il');
   a.href = 'https://en.wikipedia.org/wiki/Special:Search?go=Go&search=' + encodeURIComponent(s.wiki);
   a.target = '_blank'; a.rel = 'noopener';
-  d.append(el('p', s.name, 'dn'), el('p', c.name + ' · ' + s.kind, 'dk'), st, el('p', s.desc, 'dd'), dl, cta);
+  d.append(el('p', s.name, 'dn'), el('p', c.name + ' · ' + s.kind, 'dk'), st, el('p', s.desc, 'dd'), dl, acts);
   if (key) d.append(key);
   d.append(el('p', 'Approximate public figures. Claims are not independently verified.', 'dnote'), a);
   return d;
@@ -5108,7 +5514,15 @@ function detail(c, s) {
 function origin(s) { return s.made_in ? 'Imported from ' + s.made_in : 'Built locally'; }
 function originLine(s) { return origin(s) + (s.maker ? ' · ' + s.maker : ''); }
 
-function onMap(s) { return ['Strike', 'Defence'].some(function (g) { return slots[g] && slots[g].s === s && slots[g].at; }); }
+function onMap(s) { return onmap.filter(function (e) { return e.s === s; }).length; }
+// Where a system can be placed: 'land' (inside its country) and/or 'sea' (a ship or submarine, anywhere at sea).
+function placeOpts(s) {
+  var o = [];
+  if (s.launch.indexOf('Land') >= 0) o.push('land');
+  if (s.launch.indexOf('Ship') >= 0 || s.launch.indexOf('Submarine') >= 0) o.push('sea');
+  return o;
+}
+function seaWord(s) { return s.launch.indexOf('Ship') >= 0 ? 'ship' : 'submarine'; }
 
 // Three levels: the category's countries -> one country's systems -> one system's details.
 function renderRoster() {
@@ -5154,8 +5568,11 @@ function renderRoster() {
       } else {
         var nm = el('span', null, 'wn');
         nm.append(el('span', null, 'dot ' + statusClass(s.status)), document.createTextNode(s.name));
-        if (onMap(s)) nm.append(el('span', 'On map', 'onmap'));
-        b.append(nm, el('span', s.kind + ' · ' + s.status, 'wk'), el('span', originLine(s), 'wo' + (s.made_in ? ' imp' : '')));
+        var nOn = onMap(s);
+        if (nOn) nm.append(el('span', nOn > 1 ? nOn + ' on map' : 'On map', 'onmap'));
+        var pf = el('span', null, 'wp');
+        (s.launch.length ? s.launch : ['Not published']).forEach(function (x) { pf.append(el('span', x === 'Not published' ? 'Launch platform not published' : x + ' launch', 'ptag')); });
+        b.append(nm, el('span', s.kind + ' · ' + s.status, 'wk'), pf, el('span', originLine(s), 'wo' + (s.made_in ? ' imp' : '')));
       }
       row.append(b);
     });
@@ -5191,17 +5608,17 @@ function toast(text, err) {
 
 // keeps the top-bar button, the one in the weapon details and the phone sheet's button in step
 function updateLaunch() {
-  var launcher = curLauncher();
-  $('#launch').hidden = !selSys;
+  var launcher = curLauncher(), can = selSys && placeOpts(selSys).length > 0;
+  $('#launch').hidden = !can;
   var pk = $('#peekact');
-  pk.hidden = !selSys || placing;
+  pk.hidden = !can || placing;
   pk.textContent = launcher ? 'Move' : 'Place launcher';
   pk.classList.toggle('moved', !!launcher);
   document.querySelectorAll('.launch').forEach(function (b) {
     b.setAttribute('aria-pressed', String(placing));
     b.classList.toggle('nudge', !placing && !launcher);
     b.classList.toggle('moved', !placing && !!launcher);
-    b.querySelector('.lt').textContent = placing ? 'Cancel' : launcher ? 'Move Launcher' : 'Select Launcher Position';
+    b.querySelector('.lt').textContent = placing ? 'Cancel' : launcher ? 'Move Launcher' : (b.dataset.label || 'Select Launcher Position');
   });
 }
 
@@ -5211,14 +5628,28 @@ function placeMsg(text, err) {
   $('#placebar').classList.toggle('err', !!err);
 }
 function placeHint() {
-  var g = grpOf(mode), other = slots[g] && slots[g].s !== selSys ? slots[g].s.name : null;
-  placeMsg('Tap inside ' + countryByIso(selIso).name + ' to place the ' + selSys.name + ' launcher.' +
-           (other ? ' It replaces ' + other + ' on the map.' : ' Pinch or drag to move the map.'));
+  if (placeOn === 'sea') {
+    var what = seaWord(selSys) + ' carrying ' + selSys.name;
+    placeMsg(moveId ? 'Tap anywhere at sea to move this ' + what + '.'
+                    : 'Tap anywhere at sea to place a ' + (onMap(selSys) ? 'new ' : '') + what + '. Pinch or drag to move the map.');
+    return;
+  }
+  var where = countryByIso(selIso).name;
+  placeMsg(moveId ? 'Tap inside ' + where + ' to move this ' + selSys.name + ' launcher.'
+                  : 'Tap inside ' + where + ' to place a ' + (onMap(selSys) ? 'new ' : '') + selSys.name + ' launcher. Pinch or drag to move the map.');
 }
 
 // Placing mode: on phone everything but the map and the placing strip is hidden.
-function setPlacing(on) {
+// id: the launcher to move; null places a new one; left out = move the one being looked at, if any.
+// where: 'land' (inside the country) or 'sea' (anywhere at sea); left out = as the launcher was placed, else the first option.
+var placeOn = 'land';
+function setPlacing(on, id, where) {
   placing = on;
+  moveId = !on ? null : id !== undefined ? id : curLauncher() ? curId : null;
+  if (on) {
+    var mv = entry(moveId), opts = placeOpts(selSys);
+    placeOn = where || (mv ? mv.on : opts[0] || 'land');
+  }
   if (svg) svg.classed('placing', on);
   document.body.classList.toggle('placing', on);
   clearTimeout(placeTimer);
@@ -5227,79 +5658,116 @@ function setPlacing(on) {
   if (on) {
     placeHint();
     if (phone()) setSheet(false);
-    flyTo(countryByIso(selIso), true);   // zoom in if the country is still too small to tap
+    if (placeOn === 'land') flyTo(countryByIso(selIso), true);   // zoom in if the country is still too small to tap
   }
   updateLaunch();
 }
 
 /* ---------- what is on the map: chips in the header ---------- */
-// One chip per system on the map (red strike, blue defence). Tap it to see the system again; ✕ removes it.
+// One chip per launcher on the map (red strike, blue defence), e.g. "S-400 · RUS". Tapping a chip (or the
+// launcher itself) opens it, with Move and Remove; nothing is removed by accident.
+var clearArmed = false, clearTimer;
 function renderChips() {
   var box = $('#chips'); box.replaceChildren();
-  ['Strike', 'Defence'].forEach(function (g) {
-    var sl = slots[g];
-    if (!sl) return;
-    var chip = el('span', null, 'chip ' + cls(sl) + (sl.s === selSys ? ' cur' : ''));
+  onmap.forEach(function (e) {
+    var chip = el('span', null, 'chip ' + cls(e) + (e.id === curId && e.s === selSys ? ' cur' : ''));
     var show = el('button', null, 'cs'); show.type = 'button';
-    show.append(el('span', null, 'cdot'), document.createTextNode(sl.s.name));
-    show.title = 'Show ' + sl.s.name;
-    show.onclick = function () { showSlot(g); };
-    var x = el('button', '✕', 'cx'); x.type = 'button';
-    x.setAttribute('aria-label', 'Remove ' + sl.s.name + ' from the map');
-    x.onclick = function () { removeSlot(g); };
-    chip.append(show, x); box.append(chip);
+    show.append(el('span', null, 'cdot'), document.createTextNode(e.s.name + ' · ' + e.c.code + (e.on === 'sea' ? ' · at sea' : '')));
+    show.title = 'Open ' + e.s.name + ' in ' + e.c.name + ' to move or remove it';
+    show.onclick = function () { showEntry(e.id, true); };
+    chip.append(show); box.append(chip);
   });
+  if (onmap.length > 1) {
+    // two taps instead of a pop-up confirm (some browsers and embedded views block pop-ups, which silently cancels)
+    var all = el('button', clearArmed ? 'Tap again to clear ' + onmap.length : 'Clear all', 'clr' + (clearArmed ? ' armed' : ''));
+    all.type = 'button';
+    all.onclick = function () {
+      if (!clearArmed) {
+        clearArmed = true; renderChips();
+        clearTimeout(clearTimer);
+        clearTimer = setTimeout(function () { clearArmed = false; renderChips(); }, 4000);
+        return;
+      }
+      clearArmed = false; clearTimeout(clearTimer);
+      var n = onmap.length;
+      onmap = []; curId = null;
+      if (placing) setPlacing(false);
+      if (mode) renderRoster(); else renderChips();
+      paint();
+      toast(n + ' launchers removed from the map.');
+    };
+    box.append(all);
+  } else {
+    clearArmed = false;
+  }
   box.hidden = !box.childElementCount;
   updatePickers();
   syncBar();
 }
 
-function showSlot(g) {
-  var sl = slots[g];
+// Open a launcher that is on the map: its category, country and system, ready to move or remove.
+function showEntry(id, fly) {
+  var e = entry(id);
+  if (!e) return;
   if (placing) setPlacing(false);
-  if (mode !== sl.cat) {
-    mode = sl.cat;
+  if (mode !== e.cat) {
+    mode = e.cat;
     $('#roster').hidden = false;
   }
+  selIso = e.c.iso; selSys = e.s; curId = e.id;
   updatePickers();
-  selIso = sl.c.iso; selSys = sl.s;
   renderRoster(); paint();
   $('#rl').scrollTop = 0;
   if (phone()) setSheet(true);
-  flyTo(sl.c);
+  if (fly) { if (e.on === 'sea') flyToSea(e); else flyTo(e.c); }   // a ship can be far from home: go to it
+  if (features) $('#msg').hidden = true;
 }
 
-function removeSlot(g) {
-  var sl = slots[g];
-  slots[g] = null;
-  if (placing && selSys === sl.s) setPlacing(false);
+function removeEntry(id) {
+  var e = entry(id);
+  if (!e) return;
+  onmap = onmap.filter(function (x) { return x.id !== id; });
+  if (curId === id) curId = null;
+  if (placing && moveId === id) setPlacing(false);
   renderRoster(); paint();
+  toast(e.s.name + ' launcher in ' + e.c.name + ' removed from the map.');
 }
 
 function onMapClick(ev) {
   if (!placing || !selSys) return;
   var c = countryByIso(selIso), pt = d3.pointer(ev, svg.node());
   var m = T.invert(pt), ll = proj.invert([m[0], m[1] / sy]);
-  // a country can have several map shapes with the same id (e.g. Australia and its offshore territory)
-  var inside = ll && features.some(function (x) { return x.id === selIso && d3.geoContains(x, ll); });
-  if (!inside) {
-    placeMsg('That’s not within ' + c.name + '. Tap inside ' + c.name + '.', true);
+  function refuse(text) {
+    placeMsg(text, true);
     clearTimeout(placeTimer);
     placeTimer = setTimeout(function () { if (placing) placeHint(); }, 3000);
-    return;
   }
-  var g = grpOf(mode);
-  if (!slots[g] || slots[g].s !== selSys) slots[g] = { cat: mode, c: c, s: selSys, at: null };
-  slots[g].at = ll;
+  if (placeOn === 'sea') {
+    // at sea = on the map and not on any land shape
+    var land = !ll || features.some(function (x) { return d3.geoContains(x, ll); });
+    if (land) { refuse('That’s land. A ' + seaWord(selSys) + ' must be placed at sea.'); return; }
+  } else {
+    // a country can have several map shapes with the same id (e.g. Australia and its offshore territory)
+    var inside = ll && features.some(function (x) { return x.id === selIso && d3.geoContains(x, ll); });
+    if (!inside) { refuse('That’s not within ' + c.name + '. Tap inside ' + c.name + '.'); return; }
+  }
+  var moving = entry(moveId), sea = placeOn === 'sea';
+  if (moving) {
+    moving.at = ll; moving.on = placeOn; curId = moving.id;
+  } else {   // every placement adds a launcher; earlier ones stay on the map
+    var e = { id: nextId++, cat: mode, c: c, s: selSys, at: ll, on: placeOn };
+    onmap.push(e); curId = e.id;
+  }
   setPlacing(false);
   renderRoster(); paint();
-  toast(selSys.name + ' launcher placed in ' + c.name + ' at ' + fmtLL(ll) + '.');
+  toast(sea ? c.name + '’s ' + seaWord(selSys) + ' carrying ' + selSys.name + ' ' + (moving ? 'moved' : 'placed') + ' at ' + fmtLL(ll) + '.'
+            : selSys.name + ' launcher ' + (moving ? 'moved' : 'placed') + ' in ' + c.name + ' at ' + fmtLL(ll) + '.');
 }
 
 // Choosing a country (in the list or on the map) narrows the panel to that country's systems.
 function pickCountry(c, fly, fromMap) {
   if (placing) setPlacing(false);
-  if (selIso !== c.iso) selSys = null;
+  if (selIso !== c.iso) { selSys = null; curId = null; }
   selIso = c.iso;
   renderRoster(); paint();
   $('#rl').scrollTop = 0;
@@ -5310,32 +5778,33 @@ function pickCountry(c, fly, fromMap) {
 function allCountries() {
   if (placing) setPlacing(false);
   var was = selIso;
-  selIso = null; selSys = null;
+  selIso = null; selSys = null; curId = null;
   renderRoster(); paint();
   var row = was && document.getElementById('n-' + was);
   if (row) row.scrollIntoView({ block: 'nearest' });
 }
 
 // Choosing a system shows its details; choosing it again closes them (back to the country's list).
-// Browsing never changes the map: a system only goes on the map (replacing the previous strike or
-// defence system) when its launcher is placed.
+// Browsing never changes the map: a launcher only goes on the map when it is placed, and placing adds
+// to what is there. If the system already has a launcher here, its details open on the latest one.
 function pickSystem(c, s) {
   if (placing) setPlacing(false);
   if (selSys === s) {
-    selSys = null;
+    selSys = null; curId = null;
     renderRoster(); paint();
     return;
   }
   selIso = c.iso; selSys = s;
+  var last = lastOf(s, c.iso); curId = last ? last.id : null;
   renderRoster(); paint();
   $('#rl').scrollTop = 0;
   if (phone()) setSheet(true);
-  flyTo(c);
+  if (last && last.on === 'sea') flyToSea(last); else flyTo(c);
 }
 
 function setMode(m) {
   if (placing) setPlacing(false);
-  mode = m; selIso = null; selSys = null;   // systems already on the map stay there
+  mode = m; selIso = null; selSys = null; curId = null;   // launchers already on the map stay there
   updatePickers();
   $('#roster').hidden = false;
   setSheet(true);
@@ -5360,7 +5829,8 @@ var PICK = { Strike: { btn: '#pickS', label: 'Choose your Strike', note: 'Pick a
 function updatePickers() {
   ['Strike', 'Defence'].forEach(function (g) {
     var b = $(PICK[g].btn), browsing = !!mode && grpOf(mode) === g;
-    var cat = browsing ? mode : (slots[g] ? slots[g].cat : null);
+    var mine = onmap.filter(function (e) { return grpOf(e.cat) === g; });
+    var cat = browsing ? mode : (mine.length ? mine[mine.length - 1].cat : null);
     b.querySelector('.pt').textContent = cat ? DATA[cat].short : PICK[g].label;
     b.classList.toggle('set', browsing);
     b.setAttribute('aria-label', PICK[g].label + (cat ? ': ' + cat : ''));
